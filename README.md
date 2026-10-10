@@ -1,7 +1,7 @@
 # cAm-DiGEan
-An end-to-end workflow for the Differential Gene Expression and Functional Analysis of samples processed with a Salmo salar Custom Affymetrix Microarray.
+An end-to-end workflow for the Differential Gene Expression and Functional Analysis of samples processed with a Salmo salar Custom Affymetrix Microarray, based on the maEndToEnd workflow (https://github.com/b-klaus/maEndToEnd).
 
-This workflow is based on the maEndToEnd workflow (https://github.com/b-klaus/maEndToEnd).
+This repository is made public to strenghten the reproducibility of the findings published in the article: xxxxpendingxxx.
 
 Most of the libraries were individually installed via R *install.packages()* and *library()* functions, few others were retrieved via *BiocManager* from BioConductor, this is specified along the script.
 
