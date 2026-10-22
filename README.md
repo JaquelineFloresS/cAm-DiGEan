@@ -7,4 +7,4 @@ Most of the libraries were individually installed via R *install.packages()* and
 
 R version 4.5.1.
 
-The platform design package, the organism data base package and the salmon transcript cluster data base package needed to analyze samples processed in the same array used in this script, are all available upon request.
+_NOTE: The platform design package, the organism data base package and the salmon transcript cluster data base package needed to analyze samples processed in the same array used in this script, are all available upon request._
