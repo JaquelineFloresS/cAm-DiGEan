@@ -1,0 +1,4828 @@
+---
+title: "Gene Expression Analysis"
+author: "Jaqueline Flores Salinas & Margarita Rivera"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Scripts General Settings
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Install necessary libraries
+```{r Libraries}
+#GENERAL BIOCONDUCTOR PACKAGES
+    library(Biobase) #Standardized data structures to represent genomic data (ExpressionSet class)
+    library(oligoClasses) #Classes for high-throughput arrays supported by oligo
+     
+#QUALITY CONTROL AND PRE-PROCESSING PACKAGES
+    library(oligo) #To analyze oligonucleotide arrays (expression/SNP/tiling/exon) at probe-level. It supports Affymetrix (CEL files).
+    library(arrayQualityMetrics) #To generate quality metrics reports for 1 and 2 color array microarray data in Bioconductor microarray data containers (ExpressionSet, NChannelSet, AffyBatch).
+     
+#ANALYSIS AND STATISTICS PACKAGES
+    library(limma) #Data analysis, linear models and diff. expression for omics data.
+    library(topGO) #For testing GOterms while accounting for the topology of the GO graph.
+    library(clusterProfiler) #For functional characteristics of omics data. We use it for the KEGG analysis
+     
+#PLOTTING AND COLOR OPTIONS PACKAGES
+    library(ggplot2) #Visualization package for various plots.
+    library(ggrepel) #Provides geoms for ggplot2 to repel overlapping text labels.
+    library(RColorBrewer) #To choose colors in heatmap and histograms.
+    library(pheatmap) #For heatmap.
+
+#FORMATTING/DOCUMENTATION PACKAGES
+    library(dplyr) #Provides simple “verbs”-functions for data manipulation tasks.
+    library(tidyr) #To create tidy data (col.=variab., row=osb., cell=value)
+    library(tidytext) #To convert text data into a tidy format (word=row) for easier analysis and visualization of text data using other tidy tools like dplyr and ggplot2
+#install.packages("tidytext")
+
+#HELPERS
+    library(stringr) #Data cleaning and preparation tasks
+    library(AnnotationDbi) #For querying and manipulating SQLite-based annotation databases in Bioconductor
+    library(ggpubr) #To create and customize publication-ready plots based on ggplot2.
+    library(cowplot) #To combine plots into a single layout for publication-ready plots 
+    library(patchwork) #To combine separate ggplots into the same graphic
+```
+
+# Create PD Package for Salmo salar Array
+Here we create the package that contains the array design.
+Which we need to read the ".CEL" files.
+This step just needs to be done one time.
+Once we have the PD package we don't need to run the code again,
+we skip this chunk and in the next one we load the package we already created.
+
+The 4 files needed to create this package can be located within the same GitHub
+repository where this script is located.
+```{r PD package creation}
+#BiocManager::install("pdInfoBuilder")
+#library(pdInfoBuilder) #to create PD package
+#packageVersion("pdInfoBuilder")
+
+#pkgSS <- new("AffyClariomSPDInfoPkgSeed",
+#             pgfFile = list.files(pattern = "pgf$"),
+#             clfFile = list.files(pattern = "clf$"),
+#             coreMps = list.files(pattern = "mps$"),
+#             transFile = "NewTranscipt.csv",
+#             author = "Jaqueline Flores",
+#             email = "slsjaque8@gmail.com", biocViews = "AnnotationData",
+#             genomebuild = "Ssal_v3.1", organism = "Atlantic Salmon",
+#             species = "Salmo salar")
+#makePdInfoPackage(pkgSS)
+
+```
+
+# Install PD (platform design) Package for Salmo salar Array
+As with every other library or package, we need to install this one
+every time we are to run the analysis.
+```{r PD package install}
+
+# Install the package
+install.packages("Path/To/Package", repos=NULL, type="source")
+
+# Load the package
+library(pd.s.salar1)
+```
+
+# Import of annotation data
+Here we import the SDRF file to obtain our samples annotation.
+We then convert the data from the file into an AnnotatedDataFrame,
+which we will need later to create an ExpressionSet object.
+
+We obtained the SDRF file by submitting our experimental data to ArrayExpress -
+Functional Genomics Data collection from BioStudies by EMBL-EBI, via their
+Annotare, their web-based submission tool for ArrayExpress.
+
+For further processing of our data, we will use sample names, from the SDRF
+"Array.Data.File" column, as row names.
+```{r SDRF file}
+# Load file
+sdrf_location <- file.path("E-MTAB-15368.sdrf.txt")
+
+# Import file
+SDRF <- read.delim(sdrf_location)
+
+# Assign row names 
+rownames(SDRF) <- SDRF$Array.Data.File
+
+# Create an AnnotatedDataFrame object
+SDRF <- AnnotatedDataFrame(SDRF)
+```
+
+# Import of microarray expression data as "ExpressionSet"
+Here we create an ExpressionSet object, which will contain
+expression data (from the ".CEL" files), pheno data (from the SDRF file) and
+the chip annotation package we specify.
+```{r ExpressionSet object}
+
+# Import files into an ExpressionSet object
+raw_data <- oligo::read.celfiles(filenames = file.path("Path/To/CEL/Files",
+                                                       SDRF$Array.Data.File),
+                                    pkgname = "pd.s.salar1", verbose = FALSE, phenoData = SDRF)
+
+# Check if the object is valid (e.g. sample names match between tables).
+stopifnot(validObject(raw_data))
+
+# View some of the lines of the raw data object
+head(Biobase::pData(raw_data))
+```
+
+We can now select the columns containing relevant information for our analysis.
+For example the ones with individuals identifiers and variables of interest.
+```{r Subselect data}
+
+# Select the relevant columns
+Biobase::pData(raw_data) <- Biobase::pData(raw_data)[, c("Source.Name",
+                                     "Characteristics.individual.",
+                                     "Factor.Value.organism.part.",
+                                     "Factor.Value.sampling.time.",
+                                     "Factor.Value.developmental.stage.")]
+```
+
+# Quality Control of the raw and normalized data
+In this section we look for outliers and how data clusters/behaves.
+We use the expression intensity values, accessed with the "exprs" function.
+
+We first visualize raw data and then repeat all plots with the normalized data.
+
+## QC for raw data
+Note: rows represent DNA locations on the chip and columns represent samples.
+```{r QC: Expression intensity values}
+
+# To see some of the rows and columns
+Biobase::exprs(raw_data)[1:5, 1:5]
+```
+
+Since expression data is commonly analyzed on a logarithmic scale,
+we calculate log2, and we then perform and plot a PCA.
+
+This particular code was used for the analysis of the ES group data.
+Here the color indicates the maturation stage (early mature/immature) and the
+shape indicates the sampling time (T0, T1 or T2), which are 2 of our 3
+variables of interest, being tissue/organism part our 3rd variable of interest.
+```{r QC: PCA of raw data}
+
+# Logaritmic scale
+exp_raw <- log2(Biobase::exprs(raw_data))
+
+# Perform the PCA
+PCA_raw <- prcomp(t(exp_raw), scale. = FALSE)
+
+# Calculate variance
+percentVar <- round(100*PCA_raw$sdev^2/sum(PCA_raw$sdev^2),1)
+
+# Calculate standard deviation
+sd_ratio <- sqrt(percentVar[2] / percentVar[1])
+
+# Prepare data frame for PCA plot
+dataGG <- data.frame(PC1 = PCA_raw$x[,1], PC2 = PCA_raw$x[,2],
+                    SamplingTime = pData(raw_data)$Factor.Value.sampling.time.,
+                    MaturationStage = pData(raw_data)$Factor.Value.developmental.stage.,
+                    OrganismPart = pData(raw_data)$Factor.Value.organism.part.)
+
+# PCA plot
+RawPlot <- ggplot(dataGG, aes(PC1, PC2)) +
+      geom_point(aes(shape = SamplingTime, colour = MaturationStage)) +
+  facet_wrap(~ OrganismPart, ncol = 1, dir = "v") +
+  ggtitle("PCA plot of the log-transformed raw expression data") +
+  xlab(paste0("PC1, VarExp: ", percentVar[1], "%")) +
+  ylab(paste0("PC2, VarExp: ", percentVar[2], "%")) +
+  theme(plot.title = element_text(hjust = 0.5))+
+  coord_fixed(ratio = sd_ratio) +
+  scale_shape_manual(values = c(4,7,15)) + 
+  scale_color_manual(values = c("darkorange2", "dodgerblue4"))
+RawPlot
+
+ggsave("RawPCA.tiff",units="in", width=6, height=4, dpi=300)
+
+```
+
+
+Here we visualize the raw data probe intensities via a boxplot graph,
+where each box represents and individual microarray or sample.
+
+The "oligo::boxplot" function accesses the expression data and performs a
+log2-transformation by default.
+
+A not homogeneous distribution of probe intensities from all arrays/samples
+is an indicative that a normalization process is required.
+```{r QC: Boxplot of raw probe intensities}
+
+oligo::boxplot(raw_data,
+               main = "Boxplot of log2-intensitites for the raw data")
+
+```
+
+
+Relative Log Expression (RLE) plots are part of the QC procedure where we can
+have a general view of the expression of all samples and identify variations.
+
+We first perform background adjustment and summarization, without
+the normalization step.
+
+Since the output data of the RMA function is in log2 scale by default, we do not
+need to further apply log2 manually.
+```{r QC: RMA without normalization}
+
+palmieri_eset <- oligo::rma(raw_data, normalize = FALSE)
+
+```
+
+We then calculate the medians of the expression values, we use rows since, in
+the ExpressionSet object the transcripts are represented by rows and the
+single microarrays by columns.
+```{r QC: RLE without normalization}
+
+# Calculate transcripts (rows) medians
+row_medians_assayData <- 
+  Biobase::rowMedians(as.matrix(Biobase::exprs(palmieri_eset)))
+
+# Substract transcript median intensity
+RLE_data <- sweep(Biobase::exprs(palmieri_eset), 1, row_medians_assayData)
+
+# Create data frame
+RLE_data <- as.data.frame(RLE_data)
+
+RLE_data_gathered <- 
+  tidyr::gather(RLE_data, sample_array, log2_expression_deviation)
+
+# Create a new column with row names
+dataGG$sample_array <- rownames(dataGG)
+
+# Move the recently created column to the first column
+dataGG <- dataGG[, c(ncol(dataGG), 1:(ncol(dataGG)-1))]
+
+# Merge data frames
+RLE_data_gathered <- merge(dataGG, RLE_data_gathered, by = "sample_array", all = TRUE)
+
+# To remove the two PCA columns, change number according to columns position
+RLE_data_gathered <- RLE_data_gathered[ , -2]
+
+# Boxplot
+ggplot2::ggplot(RLE_data_gathered, aes(sample_array,
+                                       log2_expression_deviation)) + 
+  geom_boxplot(outlier.shape = NA, aes(colour = MaturationStage, fill = SamplingTime)) +
+  facet_wrap(~ OrganismPart, ncol = 1, dir = "v") +
+  ylim(c(-2, 2)) + 
+  theme(axis.text.x = element_text(colour = "aquamarine4", 
+                                  angle = 60, size = 6.5, hjust = 1 ,
+                                  face = "bold"))+
+  scale_fill_manual(values = c("white", "burlywood" , "cornflowerblue"))+
+  scale_color_manual(values = c("darkorange4", "darkblue"))
+
+ggsave("RLEplot.tiff",units="in", width=10, height=8, dpi=300)
+
+```
+
+## QC for normalized data
+Here we apply the full RMA algorithm to perform background adjustment,
+normalization and summarization of our data.
+```{r QC: RMA with normalization}
+
+palmieri_eset_norm <- oligo::rma(raw_data, normalize=TRUE)
+
+```
+
+Once normalization is done, we can repeat some of the QC analysis and plots
+obtained for the raw data to compare and assess quality of the normalized data.
+
+Again, this code was used for the analysis of the ES group data, and so the
+color indicates the maturation stage (early mature/immature) and the
+shape indicates the sampling time (T0, T1 or T2), which are 2 of our 3
+variables of interest, being tissue/organism part our 3rd variable of interest.
+```{r QC: PCA of normalized data}
+
+# Extract expression values
+exp_palmieri <- Biobase::exprs(palmieri_eset_norm)
+
+# Perform the PCA
+PCA <- prcomp(t(exp_palmieri), scale = FALSE)
+
+# Calculate variance
+percentVar <- round(100*PCA$sdev^2/sum(PCA$sdev^2),1)
+
+# Calculate standard deviation
+sd_ratio <- sqrt(percentVar[2] / percentVar[1])
+
+# Prepare data frame for PCA plot
+dataGG <- data.frame(PC1 = PCA$x[,1], PC2 = PCA$x[,2],
+                    SamplingTime = 
+                     Biobase::pData(palmieri_eset_norm)$Factor.Value.sampling.time.,
+                    MaturationStage = 
+                     Biobase::pData(palmieri_eset_norm)$Factor.Value.developmental.stage.,
+                    OrganismPart = 
+                     Biobase::pData(palmieri_eset_norm)$Factor.Value.organism.part.)
+
+
+RMAPlot <- ggplot(dataGG, aes(PC1, PC2)) +
+      geom_point(aes(shape = SamplingTime, colour = MaturationStage)) +
+  facet_wrap(~ OrganismPart, ncol = 1, dir = "v") +
+  ggtitle("PCA plot of the calibrated, summarized data") +
+  xlab(paste0("PC1, VarExp: ", percentVar[1], "%")) +
+  ylab(paste0("PC2, VarExp: ", percentVar[2], "%")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  coord_fixed(ratio = sd_ratio) +
+  scale_shape_manual(values = c(4,7,15)) + 
+  scale_color_manual(values = c("darkorange2", "dodgerblue4"))
+RMAPlot
+
+ggsave("RMA_PCA.tiff",units="in", width=6, height=4, dpi=300)
+
+```
+
+Here we repeat the intensities boxplot with the normalized data to verify that
+now all boxes show an even intensity distribution.
+```{r QC: Boxplot of normalized probe intensities}
+
+oligo::boxplot(palmieri_eset_norm, 
+               main = "Boxplot of log2-intensitites for the normalized data")
+```
+
+Here we repeat the RLE plot with the normalized data to verify that
+now all boxes show an even intensity distribution.
+```{r QC: RLE with normalization}
+
+# Calculate transcripts (rows) medians
+row_mediansNorm_assayData <- 
+  Biobase::rowMedians(as.matrix(Biobase::exprs(palmieri_eset_norm)))
+
+# Substract transcript median intensity
+RLEnorm_data <- sweep(Biobase::exprs(palmieri_eset_norm), 1, row_mediansNorm_assayData)
+
+# Create data frame
+RLEnorm_data <- as.data.frame(RLEnorm_data)
+
+RLEnorm_data_gathered <- 
+  tidyr::gather(RLEnorm_data, sample_array, log2_expression_deviation)
+
+# Create a new column with row names
+dataGG$sample_array <- rownames(dataGG)
+
+# Move the recently created column to the first column
+dataGG <- dataGG[, c(ncol(dataGG), 1:(ncol(dataGG)-1))]
+
+# Merge data frames
+RLEnorm_data_gathered <- merge(dataGG, RLEnorm_data_gathered, by = "sample_array", all = TRUE)
+
+# To remove the two PCA columns, change number according to columns position
+RLEnorm_data_gathered <- RLEnorm_data_gathered[ , -2]
+
+# Boxplot
+ggplot2::ggplot(RLEnorm_data_gathered, aes(sample_array,
+                                       log2_expression_deviation)) + 
+  geom_boxplot(outlier.shape = NA, aes(colour = MaturationStage, fill = SamplingTime)) +
+  facet_wrap(~ OrganismPart, ncol = 1, dir = "v") +
+  ylim(c(-2, 2)) + 
+  theme(axis.text.x = element_text(colour = "aquamarine4", 
+                                  angle = 60, size = 6.5, hjust = 1 ,
+                                  face = "bold"))+
+  scale_fill_manual(values = c("white", "burlywood" , "cornflowerblue"))+
+  scale_color_manual(values = c("darkorange4", "darkblue"))
+
+ggsave("RLEplotNorm.tiff",units="in", width=10, height=8, dpi=300)
+
+```
+
+Once we corroborate that all samples are normalized we perform a heatmap
+clustering analysis with the sample-to-sample distances, where sample names
+are row-names, to see how well samples cluster regarding our study variables.
+```{r QC: Heatmap of normalized data}
+
+# Get distances
+dists <- as.matrix(dist(t(exp_palmieri), method = "manhattan"))
+
+# Use row names
+rownames(dists) <- row.names(pData(palmieri_eset_norm))
+
+# Choose color palette
+hmcol <- rev(colorRampPalette(RColorBrewer::brewer.pal(9, "YlOrRd"))(255))
+colnames(dists) <- NULL
+diag(dists) <- NA
+
+# Set annotation data
+annotation_for_heatmapALL <- data.frame(dataGG$SamplingTime, dataGG$MaturationStage, dataGG$OrganismPart)
+row.names(annotation_for_heatmapALL) <- row.names(pData(palmieri_eset_norm))
+
+# Colors for annotation data
+ann_colors <- list(
+    SamplingTime = c("blue4","darkcyan","cadetblue3"),
+    MaturationStage = c("darksalmon","darkolivegreen3"),
+    OrganismPart = c("burlywood","white", "azure3"))
+
+# Plot heatmap
+png("HeatmapRMA.png", width = 4000, height = 4000, res = 300)
+pheatmap(dists, col = (hmcol), 
+         annotation_row = annotation_for_heatmap,
+         annotation_colors = ann_colors,
+         legend = TRUE, 
+         treeheight_row = 0,
+         legend_breaks = c(min(dists, na.rm = TRUE), 
+                         max(dists, na.rm = TRUE)), 
+         legend_labels = (c("small distance", "large distance")),
+         main = "Clustering heatmap for the calibrated samples")
+dev.off()
+
+# Optional: Generate individual heatmaps by OrganismPart
+parts <- unique(as.character(annotation_for_heatmapALL$OrganismPart))
+parts <- parts[!is.na(parts)]  # drop NA parts
+
+for (part in parts) {
+    
+     # samples belonging to this OrganismPart
+    subset_samples <- rownames(annotation_for_heatmapALL)[annotation_for_heatmapALL$OrganismPart == part]
+    
+    # intersect with dists rownames in case some names are missing / mismatched
+    subset_samples_in_dists <- intersect(subset_samples, rownames(dists))
+    
+      if (length(subset_samples_in_dists) == 0) {
+    message("Skipping '", part, "': no matching samples found in distance matrix.")
+    next
+  }
+
+  if (length(subset_samples_in_dists) < 2) {
+    message("Skipping '", part, "': only ", length(subset_samples_in_dists), " sample(s) — need >=2 to plot a heatmap.")
+    next
+  }
+    
+    sub_dists <- dists[subset_samples_in_dists, subset_samples_in_dists, drop = FALSE]
+    sub_annotation <- annotation_for_heatmapALL[subset_samples_in_dists, , drop = FALSE]
+    
+    # sanitize filename (remove/replace spaces and problematic chars)
+  safe_part <- gsub("[^A-Za-z0-9_\\-]", "_", part)
+  file_name <- paste0("Heatmap_", safe_part, ".png")
+
+    # plot
+    png(file_name, width = 4000, height = 4000, res = 300)
+    pheatmap(sub_dists,
+        col = hmcol,
+        annotation_row = sub_annotation,
+        annotation_colors = ann_colors,
+        legend = TRUE,
+        treeheight_row = 0,
+        legend_breaks = c(min(sub_dists, na.rm = TRUE), max(sub_dists, na.rm = TRUE)),
+        legend_labels = c("small distance", "large distance"),
+        main = paste("Clustering heatmap -", part)
+    )
+    dev.off()
+    
+    message("Saved heatmap for: ", part)
+}
+```
+
+
+Since microarray data can have probes with low intensity and low variance
+across arrays, these could be wrongly detected as differentially expressed,
+so here we produce a histogram based on median probe intensities to visualize
+their distribution, and check if a filtering based on intensity is needed.
+
+Our histogram showed we can see a normal distribution, so we 
+decide NOT to proceed with any filtering since it doesn't seem necessary.
+```{r QC: Intensity histogram}
+
+palmieri_medians <- rowMedians(Biobase::exprs(palmieri_eset_norm))
+
+hist_res <- hist(palmieri_medians, 100, col = "cornsilk1", freq = FALSE, 
+            main = "Histogram of the median intensities", 
+            border = "antiquewhite4",
+            xlab = "Median intensities")
+```
+
+
+# Annotation of the Transcript Clusters
+To continue with the linear models and differential gene expression analysis
+we need to add annotation data for the probes into our ExpressionSet object.
+
+## Create Organism DB for Salmo salar
+Here we first create a database package containing the organisms data from NCBI.
+This DB, similarly to the PD package, is created once and installed when needed.
+```{r Annotation of TC: Organism DB}
+#library(AnnotationForge)
+#makeOrgPackageFromNCBI(version = "0.1",
+#                       author = "Jaqueline Flores Salinas <slsjaque8@gmail.com>",
+#                       maintainer = "NA",
+#                       outputDir = "/Users/jfs/Desktop/Thesis/RNA/ToAnalyze/R_Analysis",
+#                       tax_id = "8030",
+#                       genus = "Salmo",
+#                       species = "salar")
+
+install.packages("/Users/jfs/Desktop/Thesis/RNA/ToAnalyze/R_Analysis/org.Ssalar.eg.db", repos = NULL, type = "source")
+library(org.Ssalar.eg.db)
+#keytypes(org.Ssalar.eg.db)
+```
+
+## Create Probe-To-Gene DB
+Here we create a Probe-To-Gene mapping database package.
+We will use the OrgDB we just created to add annotation data to the probes in
+the array, and we will use the REFSEQ number to link probes with the OrgDB data.
+This DB, similarly to the other two, is created once and installed when needed.
+
+Here we need an ADF file, which we obtained by submitting the microarray design
+to the ArrayExpress - Functional Genomics Data collection from BioStudies
+by EMBL-EBI.
+```{r Annotation of TC: Probe-To-Gene DB}
+#BiocManager::install("AnnotationForge")
+#library(AnnotationForge)
+
+#packageVersion("AnnotationForge")
+#args(AnnotationForge::makeChipPackage)
+#ls("package:AnnotationForge")
+#getAnywhere(makeProbePackage)
+
+# Read the ADF, making sure the array controls are removed
+#adf <- read.delim("A-MTAB-712.adf.txt", stringsAsFactors = FALSE)
+#head(colnames(adf))
+
+# Extract REFSEQ and PROBEID columns
+#library(dplyr)
+#library(tidyr)
+
+#refseq_map <- adf %>%
+#  select(PROBEID = Reporter.Name, REFSEQ = Reporter.Database.Entry..genbank.)
+
+#write.csv(refseq_map, "ss_refseqmapping.csv", row.names = FALSE)
+# It contains 54,777 rows and 2 columns
+
+# Remove NAs in REFSEQ column and separate rows because some have more than 1 REFSEQ
+#refseq_long <- refseq_map %>%
+#  filter(!is.na(REFSEQ)) %>%
+#  separate_rows(REFSEQ, sep = ";") %>%
+#  mutate(REFSEQ = trimws(REFSEQ))  # Remove any leading/trailing spaces
+
+#write.csv(refseq_long, "ss_refseqmapLong.csv", row.names = FALSE)
+# It contains 112,874 rows and 2 columns
+
+# Create an object with REFSEQ from ADF file and match with ENTREZID from OrgDB
+#annotation_info <- AnnotationDbi::select(
+#  org.Ssalar.eg.db,
+#  keys = unique(refseq_long$REFSEQ),
+#  keytype = "REFSEQ",
+#  columns = c("ENTREZID"))
+
+# Create another object joining by REFSEQ column, having REFSEQ, PROBEID, ENTREZID
+#final_annotation <- refseq_long %>%
+#  left_join(annotation_info, by = c("REFSEQ" = "REFSEQ"))
+
+#write.csv(final_annotation, "ss_annotationEntrez.csv", row.names = FALSE)
+# It contains 112,874 rows and 3 columns
+ 
+# Build final mapping with the 2 columns (PROBEID and ENTREZID) needed for further analysis
+#mapping_df <- data.frame(
+#  probes = final_annotation$PROBEID,  # has to be named "probes" because of internal coding
+#  genes  = final_annotation$ENTREZID,
+#  stringsAsFactors = FALSE)
+
+#write.csv(mapping_df, "ss_MappingProbeGene.csv", row.names = FALSE)
+# It contains 112,874 rows and 2 columns
+
+# Remove NAs
+#mapping_df <- mapping_df[!is.na(mapping_df$genes), ]
+# This reduces it from 112,874 to 107,753 rows (PROBEID-ENTREZID combinations)
+
+#write.csv(mapping_df, "ss_MappingNotNA.csv", row.names = FALSE)
+# It contains 107,753 rows and 2 columns
+
+# Remove duplicated probe-gene combinations
+#mapping_df <- unique(mapping_df)
+# This reduces it from 107,753 to 50,208 rows (PROBEID-ENTREZID combinations)
+# In ADF there were rows (probes) with more than 1 REFSEQs, when separating 1 REFSEQs per row we got duplicated rows (same probes and same ENTREZID, with different REFSEQ).
+
+# Save the mapping file
+#write.csv(mapping_df, "ss_MappingUnique.csv", row.names = FALSE)
+# It contains 50,208 rows and 2 columns
+
+# Use it with makeChipPackage()
+#makeChipPackage(
+#  prefix = "salmontranscriptcluster",
+#  probeFrame = mapping_df,
+#  orgPkgName = "org.Ssalar.eg.db",
+#  version = "1.0.0",
+#  maintainer = "Jaqueline Flores <slsjaque8@gmail.com>",
+#  author = "Jaqueline Flores <slsjaque8@gmail.com>",
+#  outputDir = "/Users/jfs/Desktop/Thesis/OneDriveUSM/RNA/ToAnalyze/R_Analysis",
+#  tax_id = "8030",
+#  genus = "Salmo",
+#  species = "salar",
+#  optionalAccessionsFrame = NULL)
+
+install.packages("/Users/jfs/Desktop/Thesis/OneDriveUSM/RNA/ToAnalyze/R_Analysis/salmontranscriptcluster.db", repos = NULL, type = "source")
+library(salmontranscriptcluster.db)
+```
+
+
+## Match Probe-To-Gene DB with Expression Data
+Here we encountered a difficulty when running the "select()" function
+from AnnotationDbi to add annotation information to our ExpressionSet object,
+we got an error indicating that there was no "c.probes" table found, so we
+proceeded as described in "Annotation of TC: TC-To-Expression - "c.probes" view"
+and create a view of our "probes" table, with the expected name "c.probes", to
+work around the issue and be able to properly use the "select()" function.
+
+Once this view is created and copied to the SQL in our package, when loading
+again the package we just need to list the tables to verify "c.probes" is there
+as it should. If there is no "c.probes" verify if the backup copy exists, if it
+does run from step 8, since you already have the EDIT SQL file with "c.probes",
+if the backup copy is not there, then run from step 7.
+```{r Annotation of TC: TC-To-Expression - "c.probes" view}
+
+# To connect with the transcript cluster DB
+#con <- AnnotationDbi::dbconn(salmontranscriptcluster.db)
+
+# 1. Find the DB file inside the package
+#db_path <- system.file("extdata", "salmontranscriptcluster.sqlite", 
+#                       package = "salmontranscriptcluster.db")
+
+# 2. Copy the DB to a writable location (working directory)
+#file.copy(db_path, "salmontranscriptcluster.sqlite", overwrite = TRUE)
+
+# 3. Connect to the writable copy
+#con <- DBI::dbConnect(RSQLite::SQLite(), "salmontranscriptcluster.sqlite")
+
+# 4. Create the needed view in the writable copy
+#DBI::dbExecute(con, 'CREATE VIEW "c.probes" AS SELECT * FROM probes;')
+
+# 5. Check if the table was created
+#DBI::dbListTables(con)
+
+# 6. Get the location of the installed package
+#pkg_path <- system.file("extdata", package = "salmontranscriptcluster.db")
+#pkg_path # prints the path
+
+# 7. Backup the original DB
+#Create a "bak" copy and overwrite any other "bak" copy
+#file.copy(
+#  file.path(pkg_path, "salmontranscriptcluster.sqlite"),
+#  file.path(pkg_path, "salmontranscriptclusterbak.sqlite"),
+#  overwrite = TRUE)
+
+# 8. Copy the contents of the edited DB into the installed file (the edited file is in the working folder so you can edit the name directly there to avoid confusions)
+#file.copy(
+#  "salmontranscriptclusterEDIT.sqlite",
+#  file.path(pkg_path, "salmontranscriptcluster.sqlite"),
+#  overwrite = TRUE)
+
+# 9. Restart R (to unload any cached DB connections) to check if AnnotationDbi
+#sees the new table
+#library(salmontranscriptcluster.db)
+#library(AnnotationDbi)
+con <- AnnotationDbi::dbconn(salmontranscriptcluster.db)
+DBI::dbListTables(con)
+```
+
+
+Once we are sure that our transcript cluster DB (TC DB) has the "c.probes" view,
+we can proceed to add annotation information from our transcript cluster DB to
+our ExpressionSet object which to this point contains all the probes in the ADF
+plus the array control probes. We do this step by linking the PROBEIDs from our
+ExpressionSet object to our TC DB so that here the TC DB can look them up
+through their ENTREZID to retrieve their associated gene symbols and gene names
+via the OrgDB we associated in our TC DB, which stores this information.
+```{r Annotation of TC: TC-To-Expression - Add annotation info}
+# 10. Use the select() function.
+anno_palmieri <- AnnotationDbi::select(salmontranscriptcluster.db,
+                                  keys = (featureNames(palmieri_eset_norm)),
+                                  columns = c("SYMBOL", "GENENAME"),
+                                  keytype = "PROBEID")
+
+write.csv(anno_palmieri, "ProbeToSymbol.csv", row.names = FALSE)
+
+anno_palmieri <- subset(anno_palmieri, !is.na(SYMBOL))
+write.csv(anno_palmieri, "ProbeToSymbolnotNA.csv", row.names = FALSE)
+
+# 11. Removing multiple mappings
+# 11.1. Group anno_palmieri by PROBEID so subsequent operations can work
+#separately on each probe group (each PROBEID).
+#This does not change how we see the object structure.
+anno_grouped <- group_by(anno_palmieri, PROBEID)
+
+# 11.2. Sum groups and indicate the number of different genes assigned to a transcript cluster in the column no_of_matches
+anno_summarized <- 
+  dplyr::summarize(anno_grouped, no_of_matches = n_distinct(SYMBOL))
+head(anno_summarized)
+
+# To filter probes that map to more than 1 probe; dim(probe_stats) prints the result
+anno_filtered <- filter(anno_summarized, no_of_matches > 1)
+head(anno_filtered)
+
+probe_stats <- anno_filtered 
+nrow(probe_stats)
+
+# 11.3. We want to remove probe IDs that match the ones in probe_stats, as those have multiple mappings, and it will be difficult to know which mapping is “correct”.
+#We assign these IDs to the variable ids_to_exclude
+ids_to_exlude <- (featureNames(palmieri_eset_norm) %in% probe_stats$PROBEID)
+table(ids_to_exlude)
+
+#We remove the duplicated probes from the ExpressionSet object 
+palmieri_final <- subset(palmieri_eset_norm, !ids_to_exlude)
+validObject(palmieri_final)
+
+# As we excluded probe IDs from the assay data, we have to also exclude them from the feature data anno_palmieri
+
+# fData enables us to access the feature data of an ExpressionSet object
+# We generate a PROBEID column in fData(palmieri_final) and assign the original row names of fData(palmieri_final) to it
+fData(palmieri_final)$PROBEID <- rownames(fData(palmieri_final))
+
+# We left-join with anno_palmieri, which already contains “SYMBOL” and “GENENAME”. This keeps the rows and columns of the first object and adds the corresponding column entries of the second object. By doing so, we thus add the “SYMBOL” and “GENENAME” columns from anno_palmieri for only the PROBEIDs that are in fData(palmieri_final) and thus get the feature Data for the filtered probes with unique mapping.
+fData(palmieri_final) <- left_join(fData(palmieri_final), anno_palmieri)
+
+# Make sure PROBEIDs are rownames in the resulting palmieri_final object
+rownames(fData(palmieri_final)) <- fData(palmieri_final)$PROBEID 
+validObject(palmieri_final)
+```
+
+
+# Differential Gene Expression (DGE) Analysis
+To determine which genes are differentially expressed in our groups we fit a 
+linear model to our expression data.
+
+We first defined our experimental variables, which in the ES group data are
+sampling times, maturation stages and tissues. Then, to better understand how
+to apply the LM to our data we took a look at the "limma" package user guide,
+and determined that the "9.7 Multi-Level Experiments" was the option that best
+suited our data.
+
+So then, here, we introduce the abbreviations
+“G”, “L” and “B” for the tissues, since we will create a model per tissue, and
+this will help to filter information, later on we use “EM” and “IM” for the
+maturation stages and “T0”, “T1” and “T2” for the sampling times.
+```{r DGE-A: Tissue abbreviation for Linear Models}
+# Extract tissue/organism part data and add abbreviations 
+tissue <- str_replace_all(Biobase::pData(palmieri_final)$Factor.Value.organism.part.,
+                  " ", "_")
+tissue <- case_when(tissue == "gonad" ~ "G",
+                           tissue == "liver" ~ "L",
+                           tissue == "brain" ~ "B")
+```
+
+Since in our data the individual/fish is duplicated in tissue, because we have
+3 tissues from the same fish, but not in maturation stage or in sampling time,
+because each fish had only 1 maturation stage and was sampled only in 1 of the 3
+sampling times, we concluded it would be less troubled if we separated tissue
+and created 3 models in total, 1 per tissue. Where all comparisons, which would
+include sampling time and maturation stage would be considered when using the
+"makeContrasts" function. This way it was also not necessary to use the blocking
+and correlation functions for the individuals in the fitted models, since we
+don't need to make comparisons within the same individual, only between them.
+
+In the linear models, the "~0" argument creates the model without an intercept,
+so all comparisons can be later specified with the "makeContrasts" function, and
+differentially expressed genes can be obtained specifically for each comparison
+with the "topTable" function.
+
+## Gonad Linear Model
+Here we filter expression data from the ExpressionSet object to only work with
+the expression data from all the gonad samples.
+```{r DGE-A: Linear Model for Gonad}
+
+# Filter gonad samples for all sampling times and maturation stages.
+keep_g <- tissue == "G"
+expr_g <- palmieri_final[, keep_g]
+meta_g <- pData(palmieri_final)[keep_g, ]
+
+# Verify if we have the same number of columns and rows.
+ncol(expr_g)
+nrow(meta_g)
+all(colnames(expr_g) == rownames(meta_g))  # should be TRUE if names exist
+
+# Create a column with our 2 remaining variables combined
+meta_g$group <- factor(paste(meta_g$Factor.Value.sampling.time., meta_g$Factor.Value.developmental.stage., sep="."))
+
+# Design matrix for Gonad samples
+design_g <- model.matrix(~0 + group, data = meta_g)
+
+# Define column and row names
+colnames(design_g) <- levels(meta_g$group)
+rownames(design_g) <- meta_g$Characteristics.individual.
+head(design_g[,])
+
+# Introduce abbreviations for maturation stages
+colnames(design_g) <- gsub("Early mature", "EM", colnames(design_g))
+colnames(design_g) <- gsub("Immature", "IM", colnames(design_g))
+colnames(design_g)
+
+# Determine & rank how many columns are linearly independent (we need all to be)
+qr(design_g)$rank
+ncol(design_g) # Verify column number
+
+# Linear model fit
+fit_g <- lmFit(expr_g, design_g)
+
+# Define contrast matrix
+contrasts_g <- makeContrasts(
+  G_T0vsT1_IM = T0.IM - T1.IM,
+  G_T0vsT1_EM = T0.IM - T1.EM,
+  G_T0vsT2_IM = T0.IM - T2.IM,
+  G_T0vsT2_EM = T0.IM - T2.EM,
+  G_T1_IMvsEM = T1.IM - T1.EM,
+  G_T1vsT2_IM = T1.IM - T2.IM,
+  G_T1IMvsT2EM = T1.IM - T2.EM,
+  G_T1EMvsT2IM = T1.EM - T2.IM,
+  G_T1vsT2_EM = T1.EM - T2.EM,
+  G_T2_IMvsEM = T2.IM - T2.EM,
+  levels = design_g
+)
+
+# Fit linear model with contrast matrix
+fit_g2 <- contrasts.fit(fit_g, contrasts_g)
+
+# Apply empirical Bayes variance smoothing to the standard errors
+fit_g2 <- eBayes(fit_g2)
+
+# Obtain differentially expressed genes for each comparison
+table_g1 <- topTable(fit_g2, coef="G_T0vsT1_IM", number = Inf)
+table_g2 <- topTable(fit_g2, coef="G_T0vsT1_EM", number = Inf)
+table_g3 <- topTable(fit_g2, coef="G_T0vsT2_IM", number = Inf)
+table_g4 <- topTable(fit_g2, coef="G_T0vsT2_EM", number = Inf)
+table_g5 <- topTable(fit_g2, coef="G_T1_IMvsEM", number = Inf)
+table_g6 <- topTable(fit_g2, coef="G_T1vsT2_IM", number = Inf)
+table_g7 <- topTable(fit_g2, coef="G_T1IMvsT2EM", number = Inf)
+table_g8 <- topTable(fit_g2, coef="G_T1EMvsT2IM", number = Inf)
+table_g9 <- topTable(fit_g2, coef="G_T1vsT2_EM", number = Inf)
+table_g10 <- topTable(fit_g2, coef="G_T2_IMvsEM", number = Inf)
+
+# Explore data
+head(table_g1)
+head(table_g2)
+
+# To get number of DE genes per comparison
+sum(table_g1$adj.P.Val < 0.05)
+
+# Check p-value distributions: Enriched near 0 → strong DE
+hist(table_g1$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T0vsT1_IM", xlab = "p-values")
+hist(table_g2$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T0vsT1_EM", xlab = "p-values")
+hist(table_g3$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T0vsT2_IM", xlab = "p-values")
+hist(table_g4$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T0vsT2_EM", xlab = "p-values")
+hist(table_g5$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T1_IMvsEM", xlab = "p-values")
+hist(table_g6$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T1vsT2_IM", xlab = "p-values")
+hist(table_g7$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T1IMvsT2EM", xlab = "p-values")
+hist(table_g8$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T1EMvsT2IM", xlab = "p-values")
+hist(table_g9$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T1vsT2_EM", xlab = "p-values")
+hist(table_g10$P.Value, col = brewer.pal(3, name = "Set2")[1],
+     main = "G_T2_IMvsEM", xlab = "p-values")
+
+```
+
+## Liver Linear Model
+Here we filter expression data from the ExpressionSet object to only work with
+the expression data from all the liver samples.
+```{r DGE-A: Linear Model for Liver}
+
+# Filter liver samples for all sampling times and maturation stages.
+keep_l <- tissue == "L"
+expr_l <- palmieri_final[, keep_l]
+meta_l <- pData(palmieri_final)[keep_l, ]
+
+# Verify if we have the same number of columns and rows.
+ncol(expr_l)
+nrow(meta_l)
+all(colnames(expr_l) == rownames(meta_l))  # should be TRUE if names exist
+
+# Create a column with our 2 remaining variables combined
+meta_l$group <- factor(paste(meta_l$Factor.Value.sampling.time., meta_l$Factor.Value.developmental.stage., sep="."))
+
+# Design matrix for Liver samples
+design_l <- model.matrix(~0 + group, data = meta_l)
+
+# Define column and row names
+colnames(design_l) <- levels(meta_l$group)
+rownames(design_l) <- meta_l$Characteristics.individual.
+head(design_l[,])
+
+# Introduce abbreviations for maturation stages
+colnames(design_l) <- gsub("Early mature", "EM", colnames(design_l))
+colnames(design_l) <- gsub("Immature", "IM", colnames(design_l))
+colnames(design_l)
+
+# Determine & rank how many columns are linearly independent (we need all to be)
+qr(design_l)$rank
+ncol(design_l) # Verify column number
+
+# Linear model fit
+fit_l <- lmFit(expr_l, design_l)
+
+# Define contrast matrix
+contrasts_l <- makeContrasts(
+  L_T0vsT1_IM = T0.IM - T1.IM,
+  L_T0vsT1_EM = T0.IM - T1.EM,
+  L_T0vsT2_IM = T0.IM - T2.IM,
+  L_T0vsT2_EM = T0.IM - T2.EM,
+  L_T1_IMvsEM = T1.IM - T1.EM,
+  L_T1vsT2_IM = T1.IM - T2.IM,
+  L_T1IMvsT2EM = T1.IM - T2.EM,
+  L_T1EMvsT2IM = T1.EM - T2.IM,
+  L_T1vsT2_EM = T1.EM - T2.EM,
+  L_T2_IMvsEM = T2.IM - T2.EM,
+  levels = design_l
+)
+
+# Fit linear model with contrast matrix
+fit_l2 <- contrasts.fit(fit_l, contrasts_l)
+
+# Apply empirical Bayes variance smoothing to the standard errors
+fit_l2 <- eBayes(fit_l2)
+
+# Obtain differentially expressed genes for each comparison
+table_l1 <- topTable(fit_l2, coef="L_T0vsT1_IM", number = Inf)
+table_l2 <- topTable(fit_l2, coef="L_T0vsT1_EM", number = Inf)
+table_l3 <- topTable(fit_l2, coef="L_T0vsT2_IM", number = Inf)
+table_l4 <- topTable(fit_l2, coef="L_T0vsT2_EM", number = Inf)
+table_l5 <- topTable(fit_l2, coef="L_T1_IMvsEM", number = Inf)
+table_l6 <- topTable(fit_l2, coef="L_T1vsT2_IM", number = Inf)
+table_l7 <- topTable(fit_l2, coef="L_T1IMvsT2EM", number = Inf)
+table_l8 <- topTable(fit_l2, coef="L_T1EMvsT2IM", number = Inf)
+table_l9 <- topTable(fit_l2, coef="L_T1vsT2_EM", number = Inf)
+table_l10 <- topTable(fit_l2, coef="L_T2_IMvsEM", number = Inf)
+
+# Explore data
+head(table_l1)
+head(table_l2)
+head(table_l3)
+head(table_l4)
+head(table_l5)
+
+# To get number of DE genes per comparison
+sum(table_l1$adj.P.Val < 0.05)
+
+# Check p-value distributions: Enriched near 0 → strong DE
+hist(table_l1$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T0vsT1_IM", xlab = "p-values")
+hist(table_l2$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T0vsT1_EM", xlab = "p-values")
+hist(table_l3$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T0vsT2_IM", xlab = "p-values")
+hist(table_l4$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T0vsT2_EM", xlab = "p-values")
+hist(table_l5$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T1_IMvsEM", xlab = "p-values")
+hist(table_l6$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T1vsT2_IM", xlab = "p-values")
+hist(table_l7$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T1IMvsT2EM", xlab = "p-values")
+hist(table_l8$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T1EMvsT2IM", xlab = "p-values")
+hist(table_l9$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T1vsT2_EM", xlab = "p-values")
+hist(table_l10$P.Value, col = brewer.pal(3, name = "Set2")[2],
+     main = "L_T2_IMvsEM", xlab = "p-values")
+```
+
+
+## Brain Linear Model
+Here we filter expression data from the ExpressionSet object to only work with
+the expression data from all the brain samples.
+```{r DGE-A: Linear Model for Brain}
+
+# Filter brain samples for all sampling times and maturation stages.
+keep_b <- tissue == "B"
+expr_b <- palmieri_final[, keep_b]
+meta_b <- pData(palmieri_final)[keep_b, ]
+
+# Verify if we have the same number of columns and rows.
+ncol(expr_b)
+nrow(meta_b)
+all(colnames(expr_b) == rownames(meta_b))  # should be TRUE if names exist
+
+# Create a column with our 2 remaining variables combined
+meta_b$group <- factor(paste(meta_b$Factor.Value.sampling.time., meta_b$Factor.Value.developmental.stage., sep="."))
+
+# Design matrix for Brain samples
+design_b <- model.matrix(~0 + group, data = meta_b)
+
+# Define column and row names
+colnames(design_b) <- levels(meta_b$group)
+rownames(design_b) <- meta_b$Characteristics.individual.
+head(design_b[,])
+
+# Introduce abbreviations for maturation stages
+colnames(design_b) <- gsub("Early mature", "EM", colnames(design_b))
+colnames(design_b) <- gsub("Immature", "IM", colnames(design_b))
+colnames(design_b)
+
+# Determine & rank how many columns are linearly independent (we need all to be)
+qr(design_b)$rank
+ncol(design_b) # Verify column number
+
+# Linear model fit
+fit_b <- lmFit(expr_b, design_b)
+
+# Define contrast matrix
+contrasts_b <- makeContrasts(
+  B_T0vsT1_IM = T0.IM - T1.IM,
+  B_T0vsT1_EM = T0.IM - T1.EM,
+  B_T0vsT2_IM = T0.IM - T2.IM,
+  B_T0vsT2_EM = T0.IM - T2.EM,
+  B_T1_IMvsEM = T1.IM - T1.EM,
+  B_T1vsT2_IM = T1.IM - T2.IM,
+  B_T1IMvsT2EM = T1.IM - T2.EM,
+  B_T1EMvsT2IM = T1.EM - T2.IM,
+  B_T1vsT2_EM = T1.EM - T2.EM,
+  B_T2_IMvsEM = T2.IM - T2.EM,
+  levels = design_b
+)
+
+# Fit linear model with contrast matrix
+fit_b2 <- contrasts.fit(fit_b, contrasts_b)
+
+# Apply empirical Bayes variance smoothing to the standard errors
+fit_b2 <- eBayes(fit_b2)
+
+# Obtain differentially expressed genes for each comparison
+table_b1 <- topTable(fit_b2, coef="B_T0vsT1_IM", number = Inf)
+table_b2 <- topTable(fit_b2, coef="B_T0vsT1_EM", number = Inf)
+table_b3 <- topTable(fit_b2, coef="B_T0vsT2_IM", number = Inf)
+table_b4 <- topTable(fit_b2, coef="B_T0vsT2_EM", number = Inf)
+table_b5 <- topTable(fit_b2, coef="B_T1_IMvsEM", number = Inf)
+table_b6 <- topTable(fit_b2, coef="B_T1vsT2_IM", number = Inf)
+table_b7 <- topTable(fit_b2, coef="B_T1IMvsT2EM", number = Inf)
+table_b8 <- topTable(fit_b2, coef="B_T1EMvsT2IM", number = Inf)
+table_b9 <- topTable(fit_b2, coef="B_T1vsT2_EM", number = Inf)
+table_b10 <- topTable(fit_b2, coef="B_T2_IMvsEM", number = Inf)
+
+# Explore data
+head(table_b1)
+head(table_b2)
+head(table_b3)
+head(table_b4)
+head(table_b5)
+
+# To get number of DE genes per comparison
+sum(table_b1$adj.P.Val < 0.05)
+
+# Check p-value distributions: Enriched near 0 → strong DE
+hist(table_b1$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T0vsT1_IM", xlab = "p-values")
+hist(table_b2$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T0vsT1_EM", xlab = "p-values")
+hist(table_b3$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T0vsT2_IM", xlab = "p-values")
+hist(table_b4$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T0vsT2_EM", xlab = "p-values")
+hist(table_b5$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T1_IMvsEM", xlab = "p-values")
+hist(table_b6$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T1vsT2_IM", xlab = "p-values")
+hist(table_b7$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T1IMvsT2EM", xlab = "p-values")
+hist(table_b8$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T1EMvsT2IM", xlab = "p-values")
+hist(table_b9$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T1vsT2_EM", xlab = "p-values")
+hist(table_b10$P.Value, col = brewer.pal(3, name = "Set2")[3],
+     main = "B_T2_IMvsEM", xlab = "p-values")
+```
+
+
+## Expression Bias Test
+Here we perform a brief check up of our data to verify which set of genes is
+best to use as background for our DGE analysis.
+Since the check up starts with one table from one tissue, we can repeat it for
+every table of every tissue, or at least some tables from all 3 tissues.
+
+In our case our test results suggested using tissue-specific backgrounds.
+```{r DGE-A: Expression Bias Test}
+
+# Define UP and DOWN gene sets (you may change the comparison being tested)
+G_UP_genes   <- rownames(table_b10)[table_b10$logFC >=  2 & table_b10$adj.P.Val < 0.05]
+G_DOWN_genes <- rownames(table_b10)[table_b10$logFC <= -2 & table_b10$adj.P.Val < 0.05]
+
+# Combine UP and DOWN genes for total DE genes
+de_genes <- c(G_UP_genes, G_DOWN_genes)
+de_genes <- de_genes[de_genes %in% rownames(expr_b)]  #Ensure DEG exist in expression object
+
+# To extract expression data as matrix
+if(class(expr_b) == "ExpressionSet") {
+  expr_b_matrix <- exprs(expr_b)  #This extracts the actual data
+} else {
+  expr_b_matrix <- expr_b  #Already a matrix
+}
+
+# Get expression means per probe
+all_avg_expr <- rowMeans(expr_b_matrix, na.rm = TRUE)
+
+# Get expression for DEG
+de_avg_expr <- all_avg_expr[de_genes]
+
+# Get expression for non-DE genes (background)
+bg_genes <- setdiff(rownames(expr_b), de_genes)
+bg_avg_expr <- all_avg_expr[bg_genes]
+
+
+# Perform a statistical test and print results
+# Wilcoxon rank-sum test (non-parametric) where:
+# H0: DE genes and background have same expression distribution
+# H1: DE genes have HIGHER expression (one-sided)
+test_result <- wilcox.test(de_avg_expr, bg_avg_expr, alternative = "greater")
+
+cat("\n========== EXPRESSION BIAS TEST RESULTS ==========\n")
+cat("DE genes median expression:", round(median(de_avg_expr), 3), "\n")
+cat("Background median expression:", round(median(bg_avg_expr), 3), "\n")
+cat("Fold difference (DE/BG):", round(median(de_avg_expr)/median(bg_avg_expr), 2), "x\n")
+cat("Wilcoxon p-value:", format(test_result$p.value, digits=3, scientific=TRUE), "\n")
+
+
+# Print interpretation of the test results
+fold_diff <- median(de_avg_expr)/median(bg_avg_expr)
+
+if(fold_diff > 2 && test_result$p.value < 0.001) {
+  cat("\n>>> STRONG BIAS DETECTED <<<\n")
+  cat("RECOMMENDATION: Use expression-matched background (genefinder)\n")
+  recommendation <- "matched"
+} else if(fold_diff > 1.5 && test_result$p.value < 0.01) {
+  cat("\n>>> MODERATE BIAS DETECTED <<<\n")
+  cat("RECOMMENDATION: Consider expression-matched background\n")
+  recommendation <- "maybe_matched"
+} else {
+  cat("\n>>> NO SIGNIFICANT BIAS <<<\n")
+  cat("RECOMMENDATION: Tissue-specific background is sufficient\n")
+  recommendation <- "tissue_only"
+}
+
+
+#This is an example of the results we got for our data
+#DE genes median expression: 6.706 
+#Background median expression: 6.024 
+#Fold difference (DE/BG): 1.11 x
+#Wilcoxon p-value: 1.6e-121
+#>>> NO SIGNIFICANT BIAS <<<
+#RECOMMENDATION: Tissue-specific background is sufficient
+```
+
+## Create Tissue-Specific Backgrounds
+Here we create the 3 tissue-specific backgrounds we will need for our analysis.
+```{r DGE-A: Tissue-Specific Backgrounds}
+
+# Function to create background
+create_tissue_bg <- function(expr_set, annotation_db = salmontranscriptcluster.db) {
+
+  # Extract expression data
+  expr_matrix <- exprs(expr_set)
+  
+  # Average expression across samples
+  avg_expr <- rowMeans(expr_matrix, na.rm = TRUE)
+  
+  # Threshold: median expression (genes "present" in tissue)
+  threshold <- median(avg_expr, na.rm = TRUE)
+  
+  # Select expressed probes
+  expressed_probes <- rownames(expr_matrix)[avg_expr > threshold]
+  
+  # Intersect with valid annotated probes
+  valid_probes <- keys(annotation_db, keytype = "PROBEID")
+  background_probes <- intersect(expressed_probes, valid_probes)
+  
+  # Map to ENTREZ
+  bg_entrez <- AnnotationDbi::select(
+    annotation_db,
+    keys = background_probes,
+    keytype = "PROBEID",
+    columns = "ENTREZID"
+  )
+  
+  # Remove duplicates and NAs
+  bg_entrez <- unique(na.omit(bg_entrez$ENTREZID))
+  
+  cat("Background created:\n")
+  cat("  Expressed probes:", length(expressed_probes), "\n")
+  cat("  With annotation:", length(background_probes), "\n")
+  cat("  Unique ENTREZ IDs:", length(bg_entrez), "\n")
+  
+  return(list(
+    probes = background_probes,
+    entrez = bg_entrez,
+    threshold = threshold
+  ))
+}
+
+# Create your 3 backgrounds
+brain_bg <- create_tissue_bg(expr_b)
+gonad_bg <- create_tissue_bg(expr_g)
+liver_bg <- create_tissue_bg(expr_l)
+
+# Check overlap between tissues
+# If you see high overlap (>90%), the tissues are very similar.
+# If you see moderate overlap (60-80%), that's somewhat expected tissue specificity.
+cat("Brain vs Gonad shared probes:", length(intersect(brain_bg$probes, gonad_bg$probes)), "\n")
+cat("Brain unique probes:", length(setdiff(brain_bg$probes, gonad_bg$probes)), "\n")
+cat("Gonad unique probes:", length(setdiff(gonad_bg$probes, brain_bg$probes)), "\n")
+
+# Save all three
+save(brain_bg, gonad_bg, liver_bg, file = "tissue_backgrounds_27mar.RData")
+
+# Verify loading works
+rm(brain_bg, gonad_bg, liver_bg)
+load("tissue_backgrounds_27mar.RData")
+ls()
+
+# Check mapping detail for one tissue
+test_map <- AnnotationDbi::select(
+  salmontranscriptcluster.db,
+  keys = brain_bg$probes[1:100],  # First 100 probes
+  keytype = "PROBEID",
+  columns = "ENTREZID"
+)
+
+# See if any probes map to multiple ENTREZ IDs
+table(table(test_map$PROBEID))
+```
+
+
+## Differentially Expressed Genes (DEG) - List of all 30 Comparisons
+Here we just create a list with all the 30 tables obtained with the "topTable"
+function in the linear model sections, which contain all the DEG between each
+one of the 30 comparisons we have between the 3 tissues.
+We create this so that we can use this list object in later stepts that involve
+functions to process all tables at the same time.
+```{r DGE-A: DEG list of all comparisons}
+
+# Create a list of all tables with the DEG from the linear models
+tables <- list(
+  B = list(
+    B_T0vsT1_IM = table_b1,
+    B_T0vsT1_EM = table_b2,
+    B_T0vsT2_IM = table_b3,
+    B_T0vsT2_EM = table_b4,
+    B_T1_IMvsEM = table_b5,
+    B_T1vsT2_IM = table_b6,
+    B_T1IMvsT2EM = table_b7,
+    B_T1EMvsT2IM = table_b8,
+    B_T1vsT2_EM = table_b9,
+    B_T2_IMvsEM = table_b10
+  ),
+  L = list(
+    L_T0vsT1_IM = table_l1,
+    L_T0vsT1_EM = table_l2,
+    L_T0vsT2_IM = table_l3,
+    L_T0vsT2_EM = table_l4,
+    L_T1_IMvsEM = table_l5,
+    L_T1vsT2_IM = table_l6,
+    L_T1IMvsT2EM = table_l7,
+    L_T1EMvsT2IM = table_l8,
+    L_T1vsT2_EM = table_l9,
+    L_T2_IMvsEM = table_l10
+  ),
+  G = list(
+    G_T0vsT1_IM = table_g1,
+    G_T0vsT1_EM = table_g2,
+    G_T0vsT2_IM = table_g3,
+    G_T0vsT2_EM = table_g4,
+    G_T1_IMvsEM = table_g5,
+    G_T1vsT2_IM = table_g6,
+    G_T1IMvsT2EM = table_g7,
+    G_T1EMvsT2IM = table_g8,
+    G_T1vsT2_EM = table_g9,
+    G_T2_IMvsEM = table_g10
+  )
+)
+
+```
+
+
+From this point forward we have duplicated chunks for the same step or analysis,
+because the first chunk has the code to process a single comparison, whereas the
+second chunk will have the code to process all the comparisons we have. This was
+useful while preparing the script, since we could use the single comparison code
+to see if the code was working and have a look at the results in each step, so
+troubleshooting was easier. And once we were sure that everything was ok with
+the code and the results, we transformed it into a loop to test all comparisons.
+
+NOTE: Since the SYMBOL annotation that will be used in the next analysis comes
+from the "palmieri_final" object, which has already been filtered for unique
+mapping, no re-annotation is needed in further steps, this also maintains
+consistency across the Volcano, GO, and KEGG analysis.
+
+# Volcano Plot Part 1: DEG Parameters - Single comparison
+This first part of the volcano plotting manages the differentially expressed
+genes identification, meaning we define the parameters that select the DEG in
+each comparison, and as a result we get a ".csv" file with the list of DEGs
+for each analyzed comparison, which is the same list we later use for the
+functional analysis (GO and KEGG analysis), and once all data is collected we
+use it for part 2 of the volcano plotting.
+```{r Volcano Plot.p1: DEG Parameters - Single}
+
+# Select one comparison to test
+tissue_test <- "G"   #"B", "L", or "G"
+comp_test   <- "G_T2_IMvsEM"  #The name here must match the names on the tables list
+table_test <- tables[[tissue_test]][[comp_test]]
+
+# Print which comparison is being tested
+cat("Running Volcano for:", comp_test, "in", tissue_test, "\n")
+
+# Store skip messages
+skip_messages <- c()
+
+# 1. Tissue-specific universe
+gene_IDs <- backgrounds[[tissue_test]]
+
+# 2. Define and classify DEGs
+tab <- table_test
+
+tab$diffexpressed <- "NO"
+tab$diffexpressed[tab$logFC >=  2 & tab$adj.P.Val < 0.05] <- "UP"
+tab$diffexpressed[tab$logFC <= -2 & tab$adj.P.Val < 0.05] <- "DOWN"
+
+# Extract DEG probe IDs
+UP_genes   <- rownames(tab)[tab$diffexpressed == "UP"]
+DOWN_genes <- rownames(tab)[tab$diffexpressed == "DOWN"]
+
+# Capture number of DEGs
+n_UP_DEG   <- length(UP_genes)
+n_DOWN_DEG <- length(DOWN_genes)
+
+# Summary table
+summary_table_volcano <- data.frame(
+  Comparison = paste(tissue_test, comp_test, sep="_"),
+  Tissue = tissue_test,
+  Direction = c("UP","DOWN"),
+  Universe_size = length(gene_IDs),
+  DEGs = c(n_UP_DEG, n_DOWN_DEG),
+  Valid_Probes = 0,
+  SYMBOLs = 0
+)
+
+# Safety check — no DEGs
+if(n_UP_DEG == 0){
+  skip_messages <- c(skip_messages, "No UP DEGs")
+}
+
+if(n_DOWN_DEG == 0){
+  skip_messages <- c(skip_messages, "No DOWN DEGs")
+}
+
+if(n_UP_DEG == 0 & n_DOWN_DEG == 0){
+  skip_messages <- c(skip_messages, "No DEGs")
+  stop("No DEGs detected")
+}
+
+
+# 3. Keep only valid probes
+valid_probes <- keys(salmontranscriptcluster.db, "PROBEID")
+
+# Capture number of valid probes
+UP_genes   <- intersect(UP_genes, valid_probes)
+DOWN_genes <- intersect(DOWN_genes, valid_probes)
+
+# Update summary table with valid DEGs
+summary_table_volcano$Valid_Probes[summary_table_volcano$Direction=="UP"] <- length(UP_genes)
+summary_table_volcano$Valid_Probes[summary_table_volcano$Direction=="DOWN"] <- length(DOWN_genes)
+
+# Safety check — no valid probes
+if(length(UP_genes) == 0){
+  skip_messages <- c(skip_messages, "No UP valid probes")
+}
+
+if(length(DOWN_genes) == 0){
+  skip_messages <- c(skip_messages, "No DOWN valid probes")
+}
+
+if(length(UP_genes) == 0 & length(DOWN_genes) == 0){
+  skip_messages <- c(skip_messages, "No valid probes")
+  stop("No valid probes detected")
+}
+
+
+# 4. Count SYMBOLs directly from table_test
+# Count unique symbols among DEGs (only valid probes)
+UP_symbols <- unique(na.omit(tab$SYMBOL[rownames(tab) %in% UP_genes]))
+DOWN_symbols <- unique(na.omit(tab$SYMBOL[rownames(tab) %in% DOWN_genes]))
+
+# Capture unique symbols
+n_UP_symbol <- length(UP_symbols)
+n_DOWN_symbol <- length(DOWN_symbols)
+
+# Update summary table with number of SYMBOLS
+summary_table_volcano$SYMBOLs[summary_table_volcano$Direction=="UP"] <- n_UP_symbol
+summary_table_volcano$SYMBOLs[summary_table_volcano$Direction=="DOWN"] <- n_DOWN_symbol
+
+
+# 5. Create DEG table
+deg_table <- tab[tab$diffexpressed != "NO", ]
+
+# Order data
+deg_table <- deg_table[
+  order(
+    deg_table$diffexpressed, # Order alphabetically
+    deg_table$adj.P.Val,     # Then: smallest FDR first
+    -abs(deg_table$logFC)    # Then: largest effect size first
+  ),
+]
+
+# Save DEG CSV
+write.csv(deg_table,
+          file = paste0("DEG_", tissue_test, "_", comp_test, ".csv"),
+          row.names = FALSE)
+
+
+# HERE WE PAUSE THE ANALYSIS, and continue at the next VolcanoPlot chunk/section
+
+# 8. Save summary + debug
+# Save summary CSV
+write.csv(summary_table_volcano,
+            file = "Volcano_summary_single.csv",
+            sep = ",",
+            row.names = FALSE,
+            col.names = !file.exists("Volcano_summary_single.csv"),
+            append = TRUE)
+
+# Create debug table
+volcano_log_single <- data.frame(
+  comparison = paste(tissue_test, comp_test, sep="_"),
+  skipped = length(skip_messages) > 0,
+  reason = ifelse(length(skip_messages) > 0,
+                  paste(skip_messages, collapse = " | "),
+                  NA)
+)
+
+# Save debug CSV
+write.csv(volcano_log_single,
+          file = "Volcano_debug_single.csv",
+            sep = ",",
+            row.names = FALSE,
+            col.names = !file.exists("Volcano_debug_single.csv"),
+            append = TRUE)
+```
+
+
+# Volcano Plot Part 1: DEG Parameters - Loop over all comparisons
+Here we repeat the volcano analysis in a loop that processes all comparisons.
+```{r Volcano Plot.p1: DEG Parameters - Loop}
+
+# A reusable volcano function
+make_volcano <- function(tab, comparison_name, tissue, backgrounds, db_object) {
+    
+    # Print to see which comparison is being processed
+    cat("Running Volcano for:", comparison_name, "in", tissue, "\n")
+  
+    # Store skip messages
+    skip_messages <- c()
+    
+    # 1. Tissue-specific universe
+    gene_IDs <- backgrounds[[tissue]]
+    
+    # 2. Define and classify DEGs
+    tab$diffexpressed <- "NO"
+    tab$diffexpressed[tab$logFC >=  2 & tab$adj.P.Val < 0.05] <- "UP"
+    tab$diffexpressed[tab$logFC <= -2 & tab$adj.P.Val < 0.05] <- "DOWN"
+    
+    # Extract DEG probe IDs
+    UP_genes   <- rownames(tab)[tab$diffexpressed == "UP"]
+    DOWN_genes <- rownames(tab)[tab$diffexpressed == "DOWN"]
+    
+    # Capture number of DEG
+    n_UP_DEG   <- length(UP_genes)
+    n_DOWN_DEG <- length(DOWN_genes)
+    
+    # Summary table
+    summary_table_volcano <- data.frame(
+      Comparison = comparison_name,
+      Tissue = tissue,
+      Direction = c("UP","DOWN"),
+      Universe_size = length(gene_IDs),
+      DEGs = c(n_UP_DEG, n_DOWN_DEG),
+      Valid_Probes = 0,
+      SYMBOLs = 0
+      )  
+    
+    # Safety check — no DEGs
+    if(n_UP_DEG == 0){
+      skip_messages <- c(skip_messages, "No UP DEGs")
+      }
+
+    if(n_DOWN_DEG == 0){
+      skip_messages <- c(skip_messages, "No DOWN DEGs")
+      }
+
+    if(n_UP_DEG == 0 & n_DOWN_DEG == 0){
+      skip_messages <- c(skip_messages, "No DEGs")
+      return(list(
+        summary = summary_table_volcano,
+        skipped = TRUE,
+        reason = paste(skip_messages, collapse = " | ")
+      ))
+      }
+
+    
+    # 3. Keep only valid probes
+    valid_probes <- keys(db_object, "PROBEID")
+
+    # Intersect DEGs with valid probes
+    UP_genes   <- intersect(UP_genes, valid_probes)
+    DOWN_genes <- intersect(DOWN_genes, valid_probes)
+
+    # Update summary table with valid DEGs
+    summary_table_volcano$Valid_Probes[summary_table_volcano$Direction=="UP"] <- length(UP_genes)
+    summary_table_volcano$Valid_Probes[summary_table_volcano$Direction=="DOWN"] <- length(DOWN_genes)
+    
+  
+    # Safety check — no valid probes
+    if(length(UP_genes) == 0){
+      skip_messages <- c(skip_messages, "No UP valid probes")
+      }
+
+    if(length(DOWN_genes) == 0){
+      skip_messages <- c(skip_messages, "No DOWN valid probes")
+      }
+
+    if(length(UP_genes) == 0 & length(DOWN_genes) == 0){
+      skip_messages <- c(skip_messages, "No valid probes")
+      return(list(
+        summary = summary_table_volcano,
+        skipped = TRUE,
+        reason = "No valid probes"
+      ))
+      }
+
+    
+    # 4. Count SYMBOLs directly from tab
+    # Count unique symbols among DEGs (only valid probes)
+    UP_symbols <- unique(na.omit(tab$SYMBOL[rownames(tab) %in% UP_genes]))
+    DOWN_symbols <- unique(na.omit(tab$SYMBOL[rownames(tab) %in% DOWN_genes]))
+
+    # Capture unique symbols
+    n_UP_symbol <- length(UP_symbols)
+    n_DOWN_symbol <- length(DOWN_symbols)
+
+    # Update summary table with number of SYMBOLS
+    summary_table_volcano$SYMBOLs[summary_table_volcano$Direction=="UP"] <- n_UP_symbol
+    summary_table_volcano$SYMBOLs[summary_table_volcano$Direction=="DOWN"] <- n_DOWN_symbol
+
+    # 5. Create DEGs table for CSV
+    deg_table <- tab[tab$diffexpressed != "NO", ]
+    
+    # Order data
+    deg_table <- deg_table[
+      order(
+        deg_table$diffexpressed, # Order alphabetically
+        deg_table$adj.P.Val,     # Then: smallest FDR first
+        -abs(deg_table$logFC)    # Then: largest effect size first
+        ),
+      ]
+   
+    
+# HERE WE PAUSE THE ANALYSIS, and continue at the next VolcanoPlot chunk/section
+
+    
+    # Save CSV with DEGs
+    write.csv(deg_table,
+            file = paste0("DEG_", comparison_name, ".csv"),
+            row.names = FALSE)
+    
+    return(list(
+      summary = summary_table_volcano,
+      skipped = FALSE,
+      reason = ifelse(length(skip_messages)>0,
+                      paste(skip_messages, collapse=" | "),
+                      NA)
+    ))
+}
+
+
+# Loop over ALL tissues and all comparisons
+volcano_results_all <- list()
+
+for (tissue in names(tables)) {
+  for (comp in names(tables[[tissue]])) {
+
+    result <- make_volcano(
+      tab = tables[[tissue]][[comp]],
+      comparison_name = paste(tissue, comp, sep="_"),
+      tissue = tissue,
+      backgrounds = backgrounds,
+      db_object = salmontranscriptcluster.db
+    )
+
+    volcano_results_all[[paste(tissue, comp, sep="_")]] <- result
+  }
+}
+
+
+# AFTER loop → create debug table
+volcano_log <- data.frame(
+  comparison = names(volcano_results_all),
+  skipped = sapply(volcano_results_all, function(x) x$skipped),
+  reason  = sapply(volcano_results_all, function(x) x$reason)
+)
+
+# Save debug table as CSV
+write.csv(volcano_log, "Volcano_debug_log.csv", row.names = FALSE)
+
+
+# AFTER loop  → create MASTER summary table
+all_summary_volcano <- do.call(rbind,
+  lapply(volcano_results_all, function(x) x$summary)
+)
+
+# Save master summary as CSV
+write.csv(all_summary_volcano,
+          file = "Volcano_summary_AllComparisons.csv",
+          sep = ",",
+          row.names = FALSE,
+          col.names = TRUE,  # Always write headers for master
+          append = FALSE)    # Fresh file, not appending
+```
+
+
+
+# Functional Annotation Analysis
+For the functional analysis of our DEG we will perform both GO and KEGG analysis.
+
+## Gene ontology (GO) based enrichment analysis - Single comparison
+GO enrichment was also done per tissue, per contrast, and performed using the
+"topGO" function from the package of the same name, with the "elim" algorithm
+and Fisher’s exact statistical test.
+```{r Functional Analysis: GO - Single}
+
+# Choose a comparison
+comparison_name <- "G5_T1_IMvsEM"
+
+# Define UP and DOWN gene sets
+UP_genes   <- rownames(table_g5)[table_g5$logFC >=  2 & table_g5$adj.P.Val < 0.05]
+DOWN_genes <- rownames(table_g5)[table_g5$logFC <= -2 & table_g5$adj.P.Val < 0.05]
+
+# Store number of DEGs for CSV
+n_UP_DEG   <- length(UP_genes)
+n_DOWN_DEG <- length(DOWN_genes)
+
+# Safety check 1 — No DEGs
+if(length(UP_genes) == 0){
+  message("No UP DEGs detected")
+}
+
+if(length(DOWN_genes) == 0){
+  message("No DOWN DEGs detected")
+}
+
+if(length(UP_genes) == 0 & length(DOWN_genes) == 0){
+  message("Skipping GO analysis: no DEGs")
+  return(NULL)
+}
+
+# Filter to keep only probes that are on the DB
+valid_probes <- keys(salmontranscriptcluster.db, "PROBEID")
+
+# Intersect objects to keep only valid probes
+UP_genes <- intersect(UP_genes, valid_probes)
+DOWN_genes <- intersect(DOWN_genes, valid_probes)
+
+# Capture valid probes to save later in CSV
+n_UP_valid   <- length(UP_genes)
+n_DOWN_valid <- length(DOWN_genes)
+
+# Safety check 2 — No valid probes in DB
+if(length(UP_genes) == 0){
+  message("No UP genes with valid PROBEID")
+}
+
+if(length(DOWN_genes) == 0){
+  message("No DOWN genes with valid PROBEID")
+}
+
+
+# Gene universe: Tissue-specific - change according to the tested comparison
+gene_IDs <- gonad_bg$probes
+
+# Extract probe → GO term mapping from salmon DB
+gene2go <- AnnotationDbi::select(
+  salmontranscriptcluster.db,
+  keys     = gene_IDs,
+  keytype  = "PROBEID",
+  columns  = "GO"
+)
+
+# Remove NAs and split into 2 columns
+gene2go <- gene2go[!is.na(gene2go$GO), ]
+gene2GO_list <- split(gene2go$GO, gene2go$PROBEID)
+
+# Store probes, from the universe, with GO annotation
+mapped_probes <- unique(gene2go$PROBEID)
+
+# Track DE-valid probes entering GO analysis
+UP_genes <- intersect(UP_genes, mapped_probes)
+DOWN_genes <- intersect(DOWN_genes, mapped_probes)
+
+# Capture valid probes with GO annotation, to save later in CSV
+n_UP_GO   <- length(UP_genes)
+n_DOWN_GO <- length(DOWN_genes)
+
+# Safety check 3 — No DEGs with GO terms
+if(length(UP_genes) == 0){
+  message("Skipping UP GO: no genes with GO annotations")
+}
+
+if(length(DOWN_genes) == 0){
+  message("Skipping DOWN GO: no genes with GO annotations")
+}
+
+
+# Extract probe → gene mapping from salmon DB
+probe2gene_table <- AnnotationDbi::select(
+  salmontranscriptcluster.db,
+  keys = gene_IDs,
+  keytype = "PROBEID",
+  columns = "SYMBOL"
+)
+
+# Remove probes without gene names
+probe2gene_table <- probe2gene_table[!is.na(probe2gene_table$SYMBOL), ]
+
+# Convert it into a mapping vector
+probe2gene <- setNames(probe2gene_table$SYMBOL, probe2gene_table$PROBEID)
+probe2gene[1]
+
+
+# Create two gene vectors
+all_genes_up <- factor(as.integer(gene_IDs %in% UP_genes, levels = c(0,1)))
+names(all_genes_up) <- gene_IDs
+
+all_genes_down <- factor(as.integer(gene_IDs %in% DOWN_genes, levels = c(0,1)))
+names(all_genes_down) <- gene_IDs
+
+# Create two topGO objects with safety check 4
+top_GO_up <- NULL
+if(length(UP_genes) > 0){
+top_GO_up <- new(
+  "topGOdata",
+  ontology = "BP",
+  allGenes = all_genes_up,
+  gene2GO  = gene2GO_list,
+  nodeSize = 10,
+  annot    = annFUN.gene2GO
+)
+}
+
+top_GO_down <- NULL
+if(length(DOWN_genes) > 0){
+top_GO_down <- new(
+  "topGOdata",
+  ontology = "BP",
+  allGenes = all_genes_down,
+  gene2GO  = gene2GO_list,
+  nodeSize = 10,
+  annot    = annFUN.gene2GO
+)
+}
+
+# Initialize result objects (prevents environment contamination)
+res_up_topGO <- NULL
+res_down_topGO <- NULL
+
+# Now the tests can be run for UP genes with safety check 5
+result_up_topGO_elim <- NULL
+if(!is.null(top_GO_up)){
+result_up_topGO_elim <- 
+  runTest(top_GO_up, algorithm = "elim", statistic = "Fisher")
+}
+
+# We extract results in data frame for UP genes with safety check 6
+if(!is.null(result_up_topGO_elim)){
+res_up_topGO <- GenTable(top_GO_up, Fisher.elim = result_up_topGO_elim,
+        orderBy = "Fisher.elim", topNodes = length(score(result_up_topGO_elim)))
+}
+head(res_up_topGO)
+
+# Convert p-values to numeric, topGO stores them as strings, for UP genes
+res_up_topGO$Fisher.elim <- as.numeric(res_up_topGO$Fisher.elim)
+head(res_up_topGO)
+
+# Remove NAs in Fisher.elim column
+res_up_topGO <- res_up_topGO[!is.na(res_up_topGO$Fisher.elim), ]
+
+# Now the tests can be run for DOWN genes  with safety check 5
+result_down_topGO_elim <- NULL
+if(!is.null(top_GO_down)){
+result_down_topGO_elim <- 
+  runTest(top_GO_down, algorithm = "elim", statistic = "Fisher")
+}
+
+# We extract results in data frame for DOWN genes with safety check 6
+if(!is.null(result_down_topGO_elim)){
+res_down_topGO <- GenTable(top_GO_down, Fisher.elim = result_down_topGO_elim,
+        orderBy = "Fisher.elim",
+        topNodes = length(score(result_down_topGO_elim)))
+}
+head(res_down_topGO)
+
+# Convert p-values to numeric, topGO stores them as strings, for DOWN genes
+res_down_topGO$Fisher.elim <- as.numeric(res_down_topGO$Fisher.elim)
+head(res_down_topGO)
+
+# Remove NAs in Fisher.elim column
+res_down_topGO <- res_down_topGO[!is.na(res_down_topGO$Fisher.elim), ]
+
+# Capture number of GO terms obtained after analysis
+n_UP_GO_terms   <- if(!is.null(res_up_topGO)) nrow(res_up_topGO) else 0
+n_DOWN_GO_terms <- if(!is.null(res_down_topGO)) nrow(res_down_topGO) else 0
+
+cat("UP GO terms:", n_UP_GO_terms, "\n")
+cat("DOWN GO terms:", n_DOWN_GO_terms, "\n")
+
+# Capture significant GO terms obtained after analysis
+n_UP_GO_sig <- if(!is.null(res_up_topGO))
+  sum(res_up_topGO$Fisher.elim < 0.05) else 0
+
+n_DOWN_GO_sig <- if(!is.null(res_down_topGO))
+  sum(res_down_topGO$Fisher.elim < 0.05) else 0
+
+# To extract probes list
+# Extract GO -> probes mappings from topGO objects
+# This function from topGO retrieves a list of the internal mapping
+GO2probe_up <- NULL
+if(!is.null(top_GO_up)){
+GO2probe_up <- genesInTerm(top_GO_up)
+}
+
+GO2probe_down <- NULL
+if(!is.null(top_GO_down)){
+GO2probe_down <- genesInTerm(top_GO_down)
+}
+
+# Function to extract probes for each GO term
+extract_probes <- function(go_ids, GO2probe, DEG_list){
+  sapply(go_ids, function(go){
+    probes <- GO2probe[[go]]
+    
+    # If GO term not found return NA
+    if(is.null(probes)) return(NA)
+    
+    # Keep only DE genes belonging to the term
+    probes <- probes[probes %in% DEG_list]
+    
+    if(length(probes) == 0) return(NA)
+    paste(probes, collapse = ",")
+  })
+}
+
+# Get probe lists for UP and DOWN tables
+if(!is.null(res_up_topGO)){
+res_up_topGO$Probes <- extract_probes(
+  res_up_topGO$GO.ID,
+  GO2probe_up,
+  UP_genes
+)
+}
+
+if(!is.null(res_down_topGO)){
+res_down_topGO$Probes <- extract_probes(
+  res_down_topGO$GO.ID,
+  GO2probe_down,
+  DOWN_genes
+)
+}
+
+# Combine UP + DOWN and add direction to GO results with safety check 7
+go_list <- list()
+if(!is.null(res_up_topGO) && is.data.frame(res_up_topGO) && nrow(res_up_topGO) > 0){
+  res_up_topGO$Direction <- "UP"
+  go_list[["UP"]] <- res_up_topGO
+}
+
+if(!is.null(res_down_topGO) && is.data.frame(res_down_topGO) && nrow(res_down_topGO) > 0){
+  res_down_topGO$Direction <- "DOWN"
+  go_list[["DOWN"]] <- res_down_topGO
+}
+
+# If no GO term results at all
+if(length(go_list) == 0){
+  message("No GO enrichment results")
+  return(NULL)
+}
+
+# Combine
+go_all <- do.call(rbind, go_list)
+
+
+# Function to convert GO terms probe lists into gene names
+convert_probes_to_genes <- function(probe_string, mapping){
+
+  if(is.na(probe_string)) return(NA)
+  probes <- unlist(strsplit(probe_string, ","))
+  genes <- mapping[probes]
+  genes <- unique(genes)
+  genes <- genes[!is.na(genes)]
+  paste(genes, collapse = ",")
+}
+
+# Apply to GO results
+go_all$GeneSymbols <- sapply(go_all$Probes, convert_probes_to_genes, probe2gene)
+
+# Count all recovered symbols
+n_UP_symbol <- length(unique(
+  na.omit(unlist(strsplit(
+    go_all$GeneSymbols[go_all$Direction == "UP"], ","
+  )))
+))
+
+n_DOWN_symbol <- length(unique(
+  na.omit(unlist(strsplit(
+    go_all$GeneSymbols[go_all$Direction == "DOWN"], ","
+  )))
+))
+
+
+# Calculate -log10Pvalue
+go_all$logPvalue <- -log10(go_all$Fisher.elim)
+
+# Separate significant GO terms
+go_sig <- go_all[go_all$Fisher.elim < 0.05, ]
+
+# Count symbols from significant GO terms
+n_UP_symbol_sig <- length(unique(
+  na.omit(unlist(strsplit(
+    go_sig$GeneSymbols[go_sig$Direction == "UP"], ","
+  )))
+))
+
+n_DOWN_symbol_sig <- length(unique(
+  na.omit(unlist(strsplit(
+    go_sig$GeneSymbols[go_sig$Direction == "DOWN"], ","
+  )))
+))
+
+
+# Build summary table
+summary_table_GO <- data.frame(
+  Comparison = rep(comparison_name,2),
+  Direction = c("UP","DOWN"),
+  Universe_size = length(gene_IDs),
+  
+  DEGs = c(n_UP_DEG, n_DOWN_DEG),
+  Probes_entering_GOmapping = c(n_UP_valid, n_DOWN_valid),
+  Probes_entering_GOenrich = c(n_UP_GO, n_DOWN_GO),
+  GO_terms = c(n_UP_GO_terms, n_DOWN_GO_terms),
+  SYMBOLs_from_GOterms = c(n_UP_symbol, n_DOWN_symbol),
+  GO_signif = c(n_UP_GO_sig, n_DOWN_GO_sig),
+  SYMBOLs_from_signifGO = c(n_UP_symbol_sig, n_DOWN_symbol_sig)
+  )
+
+
+# Save summary table, per each comparison tested, in a master CSV
+write.csv(summary_table_GO,
+            file = "7mayGO_summary_AllComparisons.csv",
+            sep = ",",
+            row.names = FALSE,
+            col.names = !file.exists("7mayGO_summary_AllComparisons.csv"),
+            append = TRUE)
+
+
+# Save topGO results for UP&DOWN genes as CSV
+write.csv(go_all,
+          file = "GO_UP_DOWN_G_T1_IMvsEM.csv",
+          row.names = FALSE)
+
+
+# Filter significant GO terms and show top 15
+go_plot <- go_all %>%
+  group_by(Direction) %>%
+  filter(Fisher.elim < 0.05) %>%        # keep only significant terms
+  arrange(Fisher.elim, .by_group = TRUE) %>%  # order by smallest p-value
+  slice_head(n = 15) %>%                # keep max 15 per group
+  ungroup()
+
+# Make sure GO terms are factors to control the order in the plot
+go_plot$Term <- factor(go_plot$Term, levels = rev(unique(go_plot$Term)))
+
+
+# Faceted dotplot (UP vs DOWN)
+if(nrow(go_plot) > 0){
+
+p <- ggplot(go_plot, aes(x = logPvalue, 
+                   y = Term,
+                   color = Direction,
+                   size = Significant)) +
+  geom_point(alpha = 0.8) +
+  facet_wrap(~Direction, scales = "free_y") +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("DOWN" = "steelblue3", "UP" = "firebrick3")) +
+  scale_size_continuous(range = c(4, 10), breaks = sort(unique(go_plot$Significant))) +  # adjust bubble sizes and only signif.numbers in legend
+  labs(
+    x = "-log10(p-value)",
+    y = "GO Term",
+    size = "Gene Count",
+    color = "Direction"
+  ) +
+  theme(
+    axis.text.y = element_text(size = 15), #bigger axis letters
+    axis.text.x = element_text(size = 14), #bigger axis numbers
+    axis.title = element_text(face = "bold", size = 18), #bold axis labels
+    strip.text = element_text(face = "bold", size = 14),  # facet labels
+    legend.title = element_text(face = "bold", size = 16),   # bold legend titles
+    legend.text = element_text(size = 14)
+  )
+
+tiff("GO_UP_DOWN_dotplot.tiff", width = 17, height = 12, units = "in", res = 600)
+
+print(p)
+
+dev.off()
+} else {
+message("No significant GO terms to plot")
+}
+
+```
+
+## Gene ontology (GO) based enrichment analysis - Loop over all comparisons
+Here we repeat the GO analysis in a loop that processes all comparisons.
+```{r Functional Analysis: GO – Loop}
+
+# Tissue-specific universe
+backgrounds <- list(
+  B = brain_bg$probes,
+  G = gonad_bg$probes,
+  L = liver_bg$probes
+  )
+
+# Create a reusable topGO function
+run_topGO_pipeline <- function(table, comp_name, tissue_name, backgrounds, db_object) {
+
+  cat("Running topGO for:", comp_name, "in", tissue_name, "\n")
+  
+  # To store skip messages from all IF sections
+  skip_messages <- c()
+
+  # 1. Tissue-specific universe
+  gene_IDs <- backgrounds[[tissue_name]]
+  
+  # 2. Extract probe → GO term mapping 
+  gene2go <- AnnotationDbi::select(
+    db_object,
+    keys = gene_IDs,
+    keytype = "PROBEID",
+    columns = "GO"
+  )
+
+  # Remove NAs and split into 2 columns
+  gene2go <- gene2go[!is.na(gene2go$GO), ]
+  gene2GO_list <- split(gene2go$GO, gene2go$PROBEID)
+  
+  # Store probes, from the tissue-specific universe, with GO annotation
+  mapped_probes <- unique(gene2go$PROBEID)
+  
+  # 3. Extract probe → gene mapping
+  probe2gene_table <- AnnotationDbi::select(
+    db_object,
+    keys = all_probeIDs,
+    keytype = "PROBEID",
+    columns = "SYMBOL"
+  )
+  
+  # Remove probes without gene names
+  probe2gene_table <- probe2gene_table[!is.na(probe2gene_table$SYMBOL), ]
+  
+  # Convert it into a mapping vector
+  probe2gene <- setNames(probe2gene_table$SYMBOL, probe2gene_table$PROBEID)
+  
+  
+  # 4. Define UP / DOWN w/logFC and FDR parameters
+  UP_genes   <- rownames(table)[table$logFC >=  2 & table$adj.P.Val < 0.05]
+  DOWN_genes <- rownames(table)[table$logFC <= -2 & table$adj.P.Val < 0.05]
+  
+  # Store number of DEGs for CSV
+  n_UP_DEG   <- length(UP_genes)
+  n_DOWN_DEG <- length(DOWN_genes)
+  
+  ## 4.1. Build summary table
+  summary_table_GO <- data.frame(
+    Comparison = comp_name,
+    Tissue = tissue_name,
+    Direction = c("UP","DOWN"),
+    
+    Universe_size = length(gene_IDs),
+  
+    DEGs = c(n_UP_DEG, n_DOWN_DEG),
+    
+    Probes_entering_GOmapping = 0,
+    Probes_entering_GOenrich = 0,
+    GO_terms = 0,
+    SYMBOLs_from_GOterms = 0,
+    GO_signif = 0,
+    SYMBOLs_from_signifGO = 0
+    )
+
+
+  # Safety check 1 — No DEGs
+  if(length(UP_genes) == 0){
+    message("No UP DEGs detected")
+    skip_messages <- c(skip_messages, "No UP DEGs")
+    }
+
+  if(length(DOWN_genes) == 0){
+    message("No DOWN DEGs detected")
+    skip_messages <- c(skip_messages, "No DOWN DEGs")
+    }
+
+  if(length(UP_genes) == 0 & length(DOWN_genes) == 0){
+    message("Skipping GO analysis: no DEGs")
+
+  return(list(
+    result = NULL,
+    summary = summary_table_GO,
+    skipped = TRUE,
+    reason = paste(skip_messages, collapse = " | ")
+  ))
+    }
+
+  
+  # 5. Filter to keep only probes that are actually on the DB
+  valid_probes <- keys(db_object, "PROBEID")
+
+  # Intersect objects to keep only valid probes
+  UP_genes <- intersect(UP_genes, valid_probes)
+  DOWN_genes <- intersect(DOWN_genes, valid_probes)
+
+  # Capture valid probes to save later in CSV
+  n_UP_valid   <- length(UP_genes)
+  n_DOWN_valid <- length(DOWN_genes)
+
+  # Update CSV with valid probes
+  summary_table_GO$Probes_entering_GOmapping[summary_table_GO$Direction=="UP"] <- n_UP_valid
+  summary_table_GO$Probes_entering_GOmapping[summary_table_GO$Direction=="DOWN"] <- n_DOWN_valid
+  
+  # Safety check 2 — No valid probes in DB
+  if(length(UP_genes) == 0){
+    message("No UP genes with valid PROBEID")
+    skip_messages <- c(skip_messages, "No UP valid PROBEID")
+    }
+
+  if(length(DOWN_genes) == 0){
+    message("No DOWN genes with valid PROBEID")
+    skip_messages <- c(skip_messages, "No DOWN valid PROBEID")
+    }
+
+  if(length(UP_genes) == 0 & length(DOWN_genes) == 0){
+    message("Skipping GO analysis: no valid PROBEIDs")
+
+  return(list(
+    result = NULL,
+    summary = summary_table_GO,
+    skipped = TRUE,
+    reason = paste(skip_messages, collapse = " | ")
+  ))
+  }
+  
+  # 6. Intersect to keep only DE-valid probes with GO annotation
+  UP_genes <- intersect(UP_genes, mapped_probes)
+  DOWN_genes <- intersect(DOWN_genes, mapped_probes)
+
+  # Capture valid probes with GO annotation, to save later in CSV
+  n_UP_GO   <- length(UP_genes)
+  n_DOWN_GO <- length(DOWN_genes)
+
+  # Update CSV with valid probes with GO annotation
+  summary_table_GO$Probes_entering_GOenrich[summary_table_GO$Direction=="UP"] <- n_UP_GO
+  summary_table_GO$Probes_entering_GOenrich[summary_table_GO$Direction=="DOWN"] <- n_DOWN_GO
+  
+  # Safety check 3 — No DEGs with GO terms
+  if(length(UP_genes) == 0){
+   message("No UP DEGs with GO annotations")
+   skip_messages <- c(skip_messages, "No UP DEGs with GO annot.")
+    }
+
+  if(length(DOWN_genes) == 0){
+    message("No DOWN DEGs detected")
+    skip_messages <- c(skip_messages, "No DOWN DEGs with GO annot.")
+    }
+
+  if(length(UP_genes) == 0 & length(DOWN_genes) == 0){
+    message("Skipping GO analysis: no DEGs with GO annotations")
+
+  return(list(
+    result = NULL,
+    summary = summary_table_GO,
+    skipped = TRUE,
+    reason = paste(skip_messages, collapse = " | ")
+    ))
+  }
+
+
+  # 7. Run topGO
+  results_list <- list()
+  
+  # For UP genes
+  # Binary vectors for UP genes (1 = DE, 0 = not DE) and convert to factor
+  all_genes_up <- factor(
+    as.integer(gene_IDs %in% UP_genes),
+    levels = c(0,1)
+  )
+  
+  # Name UP genes vector with Affy transcript cluster IDs
+  names(all_genes_up) <- gene_IDs
+
+  # Create topGO object for UP genes
+  topGO_up <- NULL
+  if(length(UP_genes) > 0){
+  topGO_up <- new("topGOdata",
+                  ontology="BP",
+                  allGenes=all_genes_up,
+                  gene2GO=gene2GO_list,
+                  nodeSize=10, #Min.num. of annotated genes to test a GOterm.
+                  annot=annFUN.gene2GO)
+}
+
+  # Run elim Fisher for UP genes
+  res_uptopGO_elim <- NULL
+  if(!is.null(topGO_up)){
+  res_uptopGO_elim <-
+    runTest(topGO_up, algorithm = "elim", statistic = "Fisher")
+  }
+  
+  # Extract as data frame for UP genes
+  res_uptopGO <- NULL
+  if(!is.null(res_uptopGO_elim)){
+  res_uptopGO <- GenTable(topGO_up, Fisher.elim = res_uptopGO_elim,
+        orderBy = "Fisher.elim", topNodes = length(score(res_uptopGO_elim)))
+  }
+
+  # Convert p-values to numeric for UP genes
+  if(!is.null(res_uptopGO)){
+  res_uptopGO$Fisher.elim <- as.numeric(res_uptopGO$Fisher.elim)
+  }
+  
+  # Remove NAs in Fisher.elim column
+  if(!is.null(res_uptopGO)){
+  res_uptopGO <- res_uptopGO[!is.na(res_uptopGO$Fisher.elim), ]
+  }
+  
+  # Condition in case topGO was performed but no terms found
+  if(is.null(res_uptopGO) || nrow(as.data.frame(res_uptopGO)) == 0){
+      message("No topGO enrichment for UP in ", comp_name)
+      skip_messages <- c(skip_messages, "UP: No enrichment")
+    } else {
+      res_uptopGO$Direction <- "UP"   # Add direction for UP genes
+      results_list[["UP"]] <- res_uptopGO   # Store results as UP genes
+    }
+
+  
+  # For DOWN genes
+  # Binary vectors for DOWN genes (1 = DE, 0 = not DE) and convert to factor
+  all_genes_down <- factor(
+    as.integer(gene_IDs %in% DOWN_genes),
+    levels = c(0,1)
+  )
+  
+  # Name DOWN genes vector with Affy transcript cluster IDs
+  names(all_genes_down) <- gene_IDs
+
+  # Create topGO object for DOWN genes
+  topGO_down <- NULL
+  if(length(DOWN_genes) > 0){
+  topGO_down <- new("topGOdata",
+                    ontology="BP",
+                    allGenes=all_genes_down,
+                    gene2GO=gene2GO_list,
+                    nodeSize=10,
+                    annot=annFUN.gene2GO)
+  }
+    
+  # Run elim Fisher for DOWN genes
+  res_downtopGO_elim <- NULL
+  if(!is.null(topGO_down)){
+  res_downtopGO_elim <-
+    runTest(topGO_down, algorithm = "elim", statistic = "Fisher")
+  }
+  
+  # Extract as data frame for DOWN genes
+  res_downtopGO <- NULL
+  if(!is.null(res_downtopGO_elim)){
+  res_downtopGO <- GenTable(topGO_down, Fisher.elim = res_downtopGO_elim,
+        orderBy = "Fisher.elim", topNodes = length(score(res_downtopGO_elim)))
+  }
+
+  # Convert p-values for DOWN genes
+  if(!is.null(res_downtopGO)){
+  res_downtopGO$Fisher.elim <- as.numeric(res_downtopGO$Fisher.elim)
+  }
+  
+  # Remove NAs in Fisher.elim column
+  if(!is.null(res_downtopGO)){
+  res_downtopGO <- res_downtopGO[!is.na(res_downtopGO$Fisher.elim), ]
+  }
+
+  # Condition in case topGO was performed but no terms found
+  if(is.null(res_downtopGO) || nrow(as.data.frame(res_downtopGO)) == 0){
+      message("No topGO enrichment for DOWN in ", comp_name)
+      skip_messages <- c(skip_messages, "DOWN: No enrichment")
+    } else {
+      res_downtopGO$Direction <- "DOWN"   # Add direction for DOWN genes
+      results_list[["DOWN"]] <- res_downtopGO   # Store results as DOWN genes
+    }
+  
+  # If no results were produced at all
+  if(length(results_list) == 0){
+    return(list(
+      result = NULL,
+      summary = summary_table_GO,
+      skipped = TRUE,
+      reason = paste(skip_messages, collapse = " | ")
+    ))
+    }
+  
+  # Capture number of GO terms obtained after analysis
+  n_UP_GO_terms   <- if(!is.null(res_uptopGO)) nrow(res_uptopGO) else 0
+  n_DOWN_GO_terms <- if(!is.null(res_downtopGO)) nrow(res_downtopGO) else 0
+
+  # Update CSV with GO results
+  summary_table_GO$GO_terms[summary_table_GO$Direction=="UP"] <- n_UP_GO_terms
+  summary_table_GO$GO_terms[summary_table_GO$Direction=="DOWN"] <- n_DOWN_GO_terms
+  
+  # Capture significant GO terms obtained after analysis
+  n_UP_GO_sig <- if(!is.null(res_uptopGO))
+    sum(res_uptopGO$Fisher.elim < 0.05) else 0
+
+  n_DOWN_GO_sig <- if(!is.null(res_downtopGO))
+    sum(res_downtopGO$Fisher.elim < 0.05) else 0
+  
+  # Update CSV with significant GO results
+  summary_table_GO$GO_signif[summary_table_GO$Direction=="UP"] <- n_UP_GO_sig
+  summary_table_GO$GO_signif[summary_table_GO$Direction=="DOWN"] <- n_DOWN_GO_sig
+  
+  # Extract GO -> probes mappings from topGO objects
+  GO2probe_up <- NULL
+  if(!is.null(topGO_up)){
+  GO2probe_up   <- genesInTerm(topGO_up)
+  }
+  
+  GO2probe_down <- NULL
+  if(!is.null(topGO_down)){
+  GO2probe_down <- genesInTerm(topGO_down)
+  }
+  
+  # Function to extract probes per GO term
+  extract_probes <- function(go_ids, GO2probe, DEG_list){
+    sapply(go_ids, function(go){
+      probes <- GO2probe[[go]]
+    
+      # If GO term not found return NA
+      if(is.null(probes)) return(NA)
+    
+      # Keep only DE genes belonging to the term
+      probes <- probes[probes %in% DEG_list]
+      if(length(probes) == 0) return(NA)
+      paste(probes, collapse = ",")
+    })
+  }
+
+  # Apply function to get probe list for UP results
+  if("UP" %in% names(results_list)){
+    res_uptopGO$Probes <- extract_probes(
+      res_uptopGO$GO.ID,
+      GO2probe_up,
+      UP_genes
+    )
+      results_list[["UP"]] <- res_uptopGO
+
+  }
+
+  # Apply function to get probe list for DOWN results
+  if("DOWN" %in% names(results_list)){
+    res_downtopGO$Probes <- extract_probes(
+      res_downtopGO$GO.ID,
+      GO2probe_down,
+      DOWN_genes
+    )
+      results_list[["DOWN"]] <- res_downtopGO
+
+  }
+  
+  
+  # Combine UP + DOWN
+  go_all <- do.call(rbind, results_list)
+  
+  # Safety check in case no probes exist
+    if(!"Probes" %in% colnames(go_all)){
+    go_all$Probes <- NA
+  }
+  
+  
+  # Function to convert probe lists into gene names
+  convert_probes_to_genes <- function(probe_string, mapping){
+    if(is.na(probe_string)) return(NA_character_)
+    probes <- unlist(strsplit(probe_string, ","))
+    genes <- mapping[probes]
+    genes <- unique(genes)
+    genes <- genes[!is.na(genes)]
+    if(length(genes) == 0) return(NA_character_)
+    paste(genes, collapse = ",")
+  }
+
+  # Convert probes to gene symbols
+  go_all$GeneSymbols <- sapply(go_all$Probes,
+                             convert_probes_to_genes,
+                             probe2gene)
+  
+  # Column to character
+  go_all$GeneSymbols <- as.character(go_all$GeneSymbols)
+  
+  # Capture symbols from GO results
+  n_UP_symbol <- length(unique(
+    na.omit(unlist(strsplit(
+      go_all$GeneSymbols[go_all$Direction == "UP"], ","
+    )))
+  ))
+
+  n_DOWN_symbol <- length(unique(
+    na.omit(unlist(strsplit(
+      go_all$GeneSymbols[go_all$Direction == "DOWN"], ","
+    )))
+  ))
+
+  
+  # Update summary table with Symbols for probes in GO results
+  summary_table_GO$SYMBOLs_from_GOterms[summary_table_GO$Direction=="UP"] <- n_UP_symbol
+  summary_table_GO$SYMBOLs_from_GOterms[summary_table_GO$Direction=="DOWN"] <- n_DOWN_symbol
+  
+  # Compute -log10Pvalue for graph
+  go_all$logPvalue <- -log10(go_all$Fisher.elim)
+
+  
+  # Separate significant GO terms
+  go_sig <- go_all[go_all$Fisher.elim < 0.05, ]
+
+  # Count symbols from significant GO terms
+  n_UP_symbol_sig <- length(unique(
+    na.omit(unlist(strsplit(
+      go_sig$GeneSymbols[go_sig$Direction == "UP"], ","
+    )))
+  ))
+
+  n_DOWN_symbol_sig <- length(unique(
+    na.omit(unlist(strsplit(
+      go_sig$GeneSymbols[go_sig$Direction == "DOWN"], ","
+    )))
+  ))
+
+  # Update summary table with Symbols for probes in GO results
+  summary_table_GO$SYMBOLs_from_signifGO[summary_table_GO$Direction=="UP"] <- n_UP_symbol_sig
+  summary_table_GO$SYMBOLs_from_signifGO[summary_table_GO$Direction=="DOWN"] <- n_DOWN_symbol_sig
+  
+  
+  # Save GO results in CSV
+  write.csv(go_all,
+            file = paste0("topGO_UP_DOWN_", comp_name, ".csv"),
+            row.names = FALSE)
+  
+  
+  # Filter only for plotting (Top 15 per group)
+  go_plot <- go_all %>%
+  group_by(Direction) %>%
+  filter(Fisher.elim < 0.05) %>%        # keep only significant terms
+  arrange(Fisher.elim, .by_group = TRUE) %>%  # order by smallest p-value
+  slice_head(n = 15) %>%                # keep max 15 per group
+  ungroup()
+
+  
+  # Make sure GO terms are factors to control the order in the plot
+  go_plot$Term <- factor(go_plot$Term,
+                        levels = rev(unique(go_plot$Term)))
+
+  # Safety check for no significant GO 
+  if(nrow(go_plot) == 0){
+   message("No significant GO terms (Pvalue<0.05) in ", comp_name)
+   skip_messages <- c(skip_messages, "No significant GO terms")
+
+  # Do NOT return — just skip plotting
+  } else {
+  
+  # Save TIFF
+  tiff(paste0("GO_UP_DOWN_", comp_name, ".tiff"),
+       width=17, height=12, units="in", res=600)
+
+  print(
+    ggplot(go_plot, aes(x = logPvalue,
+                       y = Term,
+                       color = Direction,
+                       size = Significant)) +
+      geom_point(alpha = 0.8) +
+      facet_wrap(~Direction, scales = "free_y") +
+      theme_minimal(base_size = 14) +
+      scale_color_manual(values = c("DOWN"="steelblue3",
+                                    "UP"="firebrick3")) +
+  scale_size_continuous(range = c(4, 10), breaks = sort(unique(go_plot$Significant))) +  # adjust bubble sizes and only signif.numbers in legend
+      labs(
+        x = "-log10(p-value)",
+        y = "GO Term",
+        size = "Gene Count",
+        color = "Direction"
+      ) +
+  theme(
+    axis.text.y = element_text(size = 15), #bigger axis letters
+    axis.text.x = element_text(size = 14), #bigger axis numbers
+    axis.title = element_text(face = "bold", size = 18), #bold axis labels
+    strip.text = element_text(face = "bold", size = 14),  # facet labels
+    legend.title = element_text(face = "bold", size = 16),   # bold legend titles
+    legend.text = element_text(size = 14)
+    )
+  )
+
+  dev.off()
+  }
+
+  return(list(
+    result = go_all,
+    summary = summary_table_GO,
+    skipped = FALSE,
+    reason = ifelse(length(skip_messages) > 0,
+                    paste(skip_messages, collapse = " | "),
+                    NA)
+  ))
+}
+
+
+# Create a list with stored results
+topGO_results_all <- list()
+
+# Loop over ALL tissues and comparisons
+for(tissue in names(tables)) {
+  for(comp in names(tables[[tissue]])) {
+    table_current <- tables[[tissue]][[comp]]
+
+    result <- run_topGO_pipeline(
+      table = table_current,
+      comp_name = paste(tissue, comp, sep="_"),
+      tissue_name = tissue,
+      backgrounds = backgrounds,
+      db_object = salmontranscriptcluster.db
+    )
+
+    topGO_results_all[[paste(tissue, comp, sep="_")]] <- result
+  }
+}
+
+# AFTER loop → create debug table
+topGO_log <- data.frame(
+  comparison = names(topGO_results_all),
+  skipped = sapply(topGO_results_all, function(x) x$skipped),
+  reason  = sapply(topGO_results_all, function(x) x$reason)
+)
+
+# Save debug table as CSV
+write.csv(topGO_log, "topGO_debug_log.csv", row.names = FALSE)
+
+# AFTER loop → create MASTER summary table
+all_summary_GO <- do.call(rbind,
+  lapply(topGO_results_all, function(x) x$summary)
+)
+
+# Save master summary as CSV
+write.csv(all_summary_GO,
+            file = "GO_summary_AllComparisons.csv",
+            sep = ",",
+            row.names = FALSE,
+            col.names = TRUE,  # Always write headers for master
+            append = FALSE)    # Fresh file, not appending
+
+```
+
+
+## KEGG Pathway Analysis - Single comparison
+Here we perform the KEGG Pathway analysis to associate DEGs with known paths.
+```{r Functional Analysis: KEGG – Single}
+
+## Comparison name
+comparison_name_test <- "B8_T1EMvsT2IM"
+
+## Define UP and DOWN gene sets
+UP_genes_test   <- rownames(table_b8)[table_b8$logFC >=  2 & table_b8$adj.P.Val < 0.05]
+DOWN_genes_test <- rownames(table_b8)[table_b8$logFC <= -2 & table_b8$adj.P.Val < 0.05]
+
+# Capture DEGs to save later in CSV
+n_UP_DEG   <- length(UP_genes)
+n_DOWN_DEG <- length(DOWN_genes)
+
+# To keep only probes that are actually on the DB
+valid_probes <- keys(salmontranscriptcluster.db, "PROBEID")
+
+UP_genes <- intersect(UP_genes, valid_probes)
+DOWN_genes <- intersect(DOWN_genes, valid_probes)
+
+# Capture valid probes to save later in CSV
+n_UP_valid   <- length(UP_genes)
+n_DOWN_valid <- length(DOWN_genes)
+
+# To check if there were no probes on the DB
+if(length(UP_genes) == 0){
+  message("No UP genes with valid PROBEID")
+}
+
+if(length(DOWN_genes) == 0){
+  message("No DOWN genes with valid PROBEID")
+}
+
+## Map UP genes to ENTREZ IDs
+if(length(UP_genes) > 0){
+
+entrez_up <- AnnotationDbi::select(
+  salmontranscriptcluster.db,
+  keys = UP_genes,
+  keytype = "PROBEID",
+  columns = "ENTREZID"
+)
+
+# Remove NAs and duplicates
+  entrez_up <- unique(na.omit(entrez_up$ENTREZID))
+  
+# Diagnostic: how many genes recovered from probes
+  cat("UP : probes =", length(UP_genes),
+    "| genes recovered =", length(entrez_up), "\n")
+
+} else {
+
+  message("Skipping UP: no valid PROBEIDs")
+  entrez_up <- character(0)
+
+}
+
+## Map DOWN genes to ENTREZ IDs
+if(length(DOWN_genes) > 0){
+  
+entrez_down <- AnnotationDbi::select(
+  salmontranscriptcluster.db,
+  keys = DOWN_genes,
+  keytype = "PROBEID",
+  columns = "ENTREZID"
+)
+
+# Remove NAs and duplicates
+  entrez_down <- unique(na.omit(entrez_down$ENTREZID))
+
+# Diagnostic: how many genes recovered from probes
+  cat("DOWN : probes =", length(DOWN_genes),
+    "| genes recovered =", length(entrez_down), "\n")
+  
+} else {
+
+  message("Skipping DOWN: no valid PROBEIDs")
+  entrez_down <- character(0)
+
+}
+
+# Capture mapped genes to save later in CSV
+n_UP_entrez   <- length(entrez_up)
+n_DOWN_entrez <- length(entrez_down)
+
+## Combine all ENTREZ IDs that will be used in enrichment
+all_entrez <- unique(c(entrez_up, entrez_down))
+
+# Map ENTREZ → gene symbols
+entrez2symbol <- AnnotationDbi::select(
+  salmontranscriptcluster.db,
+  keys = all_entrez,
+  keytype = "ENTREZID",
+  columns = "SYMBOL"
+)
+
+# Convert to mapping vector
+entrez2symbol_map <- setNames(entrez2symbol$SYMBOL,
+                              entrez2symbol$ENTREZID)
+
+
+## Run KEGG enrichment separately for UP and DOWN
+kegg_up <- NULL
+if(length(entrez_up) > 0){
+  
+kegg_up <- enrichKEGG(
+  gene = entrez_up,
+  organism = "sasa",
+  universe = brain_bg$entrez,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 1
+)
+
+} else {
+  message("Skipping UP: no ENTREZIDs")
+}
+
+
+kegg_down <- NULL
+if(length(entrez_down) > 0){
+  
+kegg_down <- enrichKEGG(
+  gene = entrez_down,
+  organism = "sasa",
+  universe = brain_bg$entrez,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 1
+)
+
+} else {
+  message("Skipping DOWN: no ENTREZIDs")
+}
+
+## Combine UP and DOWN KEGG results
+# Create data frame
+kegg_up_df <- if(!is.null(kegg_up)) data.frame(kegg_up) else data.frame()
+kegg_down_df <- if(!is.null(kegg_down)) data.frame(kegg_down) else data.frame()
+
+# Capture KEGG results to save later in CSV
+n_UP_kegg   <- nrow(kegg_up_df)
+n_DOWN_kegg <- nrow(kegg_down_df)
+
+# Add direction only when the object has results so the code runs does not stop
+kegg_list <- list()
+
+if(nrow(kegg_up_df) > 0){
+  kegg_up_df$Direction <- "UP"
+  kegg_list[["UP"]] <- kegg_up_df
+}
+
+if(nrow(kegg_down_df) > 0){
+  kegg_down_df$Direction <- "DOWN"
+  kegg_list[["DOWN"]] <- kegg_down_df
+}
+
+# If no KEGG results at all
+if(length(kegg_list) == 0){
+  stop("No KEGG enrichment found for UP or DOWN genes.")
+  return(NULL)
+}
+
+# Combine
+kegg_all <- do.call(rbind, kegg_list)
+
+# Add -log10 for FDR
+kegg_all$logFDR <- -log10(kegg_all$p.adjust)
+
+## Convert KEGG gene lists to SYMBOLS
+# Function to convert gene lists to SYMBOLS
+convert_entrez_to_symbol <- function(entrez_string, mapping){
+  entrez <- unlist(strsplit(entrez_string, "/"))
+  genes <- mapping[entrez]
+  genes <- unique(genes)
+  genes <- genes[!is.na(genes)]
+  paste(genes, collapse = ",")
+}
+
+# Apply to KEGG results
+kegg_all$GeneSymbols <- sapply(kegg_all$geneID,
+                               convert_entrez_to_symbol,
+                               entrez2symbol_map)
+
+# Capture GeneSymbols from KEGG results to save later in CSV
+n_UP_symbol <- length(unique(na.omit(unlist(strsplit(
+  kegg_all$GeneSymbols[kegg_all$Direction == "UP"], ",")))))
+  
+n_DOWN_symbol <- length(unique(na.omit(unlist(strsplit(
+  kegg_all$GeneSymbols[kegg_all$Direction == "DOWN"], ",")))))
+
+## Capture significant KEGGs per direction to save later  in CSV
+n_UP_kegg_sig <- sum(kegg_all$Direction == "UP" & kegg_all$p.adjust < 0.05)
+n_DOWN_kegg_sig <- sum(kegg_all$Direction == "DOWN" & kegg_all$p.adjust < 0.05)
+
+## Build summary table for mapping data
+summary_table <- data.frame(
+  Comparison = rep(comparison_name, 2),
+  Direction = c("UP", "DOWN"),
+  DEGs = c(n_UP_DEG, n_DOWN_DEG),
+  Probes_entering_ENTREZmapping = c(n_UP_valid, n_DOWN_valid),
+  Probes_with_mappedENTREZ = c(n_UP_entrez, n_DOWN_entrez),
+  KEGG_pathways = c(n_UP_kegg, n_DOWN_kegg),
+  SYMBOLs_from_KEGGenrich = c(n_UP_symbol, n_DOWN_symbol),
+  KEGG_signif = c(n_UP_kegg_sig, n_DOWN_kegg_sig),
+  
+  Lost_DEGs = c(n_UP_DEG - n_UP_valid, n_DOWN_DEG - n_DOWN_valid),
+  Lost_valid_probes = c(n_UP_valid - n_UP_entrez, n_DOWN_valid - n_DOWN_entrez),
+  Lost_ENTREZ = c(n_UP_entrez - n_UP_symbol, n_DOWN_entrez - n_DOWN_symbol),
+  Lost_KEGG = c(n_UP_kegg - n_UP_kegg_sig, n_DOWN_kegg - n_DOWN_kegg_sig),
+  
+  Lost_DEGs_pct = c(round((n_UP_DEG - n_UP_valid) / n_UP_DEG * 100, 2),
+                      round((n_DOWN_DEG - n_DOWN_valid) / n_DOWN_DEG * 100, 2)),
+  Lost_ENTREZ_pct = c(if(n_UP_entrez > 0)
+    round((n_UP_entrez - n_UP_symbol) / n_UP_entrez * 100, 2) else 0,
+                      if(n_DOWN_entrez > 0)
+    round((n_DOWN_entrez - n_DOWN_symbol) / n_DOWN_entrez * 100, 2) else 0),
+  Lost_KEGG_pct = c(if(n_UP_kegg > 0)
+    round((n_UP_kegg - n_UP_kegg_sig) / n_UP_kegg * 100, 2) else 0,
+                    if(n_DOWN_kegg > 0)
+    round((n_DOWN_kegg - n_DOWN_kegg_sig) / n_DOWN_kegg * 100, 2) else 0)
+)
+  
+# Save summary table, per each comparison tested, in a master CSV
+write.table(summary_table,
+            file = "KEGG_summary_AllComparisons.csv",
+            sep = ",",
+            row.names = FALSE,
+            col.names = !file.exists("KEGG_summary_AllComparisons.csv"),
+            append = TRUE)
+
+## Save KEGG results in CSV
+  write.csv(kegg_all,
+            file = "KEGG_UP_DOWN.csv",
+            row.names = FALSE)
+  
+## Select top pathways per direction
+  kegg_plot <- kegg_all %>% 
+    group_by(Direction) %>% 
+    filter(p.adjust < 0.05) %>%  # keep only significant paths
+    arrange(p.adjust, .by_group = TRUE) %>% 
+    slice_head(n = 15) %>% # keep max 15 per group
+    ungroup()
+
+## Faceted KEGG UP/DOWN dotplot
+if(nrow(kegg_plot) > 0){
+  
+  p <- ggplot(kegg_plot, aes(x = logFDR,
+                     y = reorder(Description, logFDR),
+                     color = Direction,
+                     size = Count)) +
+  geom_point(alpha = 0.8) +
+  facet_wrap(~Direction, scales = "free_y") +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("DOWN"="steelblue3", "UP"="firebrick3")) +
+  scale_size_continuous(range = c(4, 10)) +
+  labs(
+    x = "-log10(FDR)",
+    y = "KEGG pathway",
+    size = "Gene Count",
+    color = "Direction"
+  ) +
+  theme(
+    axis.text.y = element_text(size = 15),
+    axis.text.x = element_text(size = 14),
+    axis.title  = element_text(face = "bold", size = 18),
+    strip.text  = element_text(face = "bold", size = 14),
+    legend.title = element_text(face = "bold", size = 16),
+    legend.text  = element_text(size = 14)
+  )
+
+tiff("KEGG_UP_DOWN_dotplot.tiff", width = 17, height = 12, units = "in", res = 600)
+
+print(p)
+
+dev.off()
+} else {
+
+  message("No significant KEGG pathways to plot")
+
+}
+
+```
+
+## KEGG Pathway Analysis - Loop over all comparisons
+Here we repeat the KEGG analysis in a loop that processes all comparisons.
+```{r Functional Analysis: KEGG – Loop}
+
+## Build ENTREZ → SYMBOL mapping once
+entrez_symbol_table <- AnnotationDbi::select(
+  salmontranscriptcluster.db,
+  keys = keys(salmontranscriptcluster.db, keytype = "ENTREZID"),
+  keytype = "ENTREZID",
+  columns = "SYMBOL"
+)
+
+# Convert to named vector for fast lookup
+entrez2symbol_map <- setNames(
+  entrez_symbol_table$SYMBOL,
+  entrez_symbol_table$ENTREZID
+)
+
+## Load tissue-specific backgrounds
+load("tissue_backgrounds_27mar.RData")
+#brain_bg, gonad_bg, liver_bg
+
+## Create a reusable KEGG function
+run_KEGG_pipeline <- function(table, comp_name, tissue_name, db_object,
+                              entrez2symbol_map) {
+
+  cat("Running KEGG for:", comp_name, "in", tissue_name,"\n")
+
+  # To save skip messages
+  skip_messages <- c()
+  
+  # To save results
+  results_list <- list()
+  
+  ## Select tissue-specific background
+  if(tissue_name == "B") {
+    background_entrez <- brain_bg$entrez
+  } else if(tissue_name == "G") {
+    background_entrez <- gonad_bg$entrez
+  } else if(tissue_name == "L") {
+    background_entrez <- liver_bg$entrez
+  } else {
+    stop("Unknown tissue: ", tissue_name)
+  }
+  
+  # To print background size
+  cat("  Background size:", length(background_entrez), "genes\n")
+  
+  # To save mapping data
+  summary_stats <- data.frame(
+    Comparison = comp_name,
+    Tissue = tissue_name,
+    Direction = c("UP","DOWN"),
+
+    Universe_size = length(background_entrez),
+
+    DEGs = 0,
+    
+    Probes_entering_ENTREZmapping = 0,
+    Genes_with_mappedENTREZ = 0,
+    KEGG_pathways = 0,
+    SYMBOLs_from_KEGGenrich = 0,
+    KEGG_significant = 0
+   )
+  
+  ## Define UP / DOWN
+  UP_genes   <- rownames(table)[table$logFC >=  2 & table$adj.P.Val < 0.05]
+  DOWN_genes <- rownames(table)[table$logFC <= -2 & table$adj.P.Val < 0.05]
+
+  # Create a list with both objects for an easier and more structured analysis
+  directions <- list(
+    UP   = UP_genes,
+    DOWN = DOWN_genes
+  )
+
+  # For each direction do this - loop for directions:
+  for(direction in names(directions)) {
+    genes_current <- directions[[direction]]
+    
+    # Define "idx" to later update summary stats easier
+    idx <- which(summary_stats$Direction == direction)
+    
+    # Capture final number of DEG genes/probes
+    n_DEG <- length(genes_current)
+    
+    # Update DEGs in summary stats
+    summary_stats$DEGs[idx] <- n_DEG
+    
+  
+  ## Safety check for when no DEGs exist for a particular direction
+  if(n_DEG == 0){
+    message("No DEGs for ", direction, " in ", comp_name)
+    skip_messages <- c(skip_messages, paste(direction, "No DEGs"))
+    next
+  }
+
+  # Keep only valid probeIDs
+  valid_probes <- keys(db_object, keytype = "PROBEID")
+  genes_current <- intersect(genes_current, valid_probes)
+  
+  # Capture final number of valid PROBEIDs 
+  n_valid <- length(genes_current)
+  
+  # Update valid probes in summary stats
+  summary_stats$Probes_entering_ENTREZmapping[idx] <- n_valid
+  
+  # Safety check for valid PROBEIDs
+  if(length(genes_current) == 0){
+  message("No valid PROBEIDs for ", direction, " in ", comp_name)
+  skip_messages <- c(skip_messages, paste(direction, "No valid PROBEIDs"))
+  next
+  }
+  
+  # Diagnostic output
+  cat("  ", direction, ": DEGs =", n_DEG, "| valid probes =", n_valid, "\n")
+
+  ## Map PROBE → ENTREZ
+    entrez_ids <- AnnotationDbi::select(
+      db_object,
+      keys = genes_current,
+      keytype = "PROBEID",
+      column = "ENTREZID"
+    )
+    
+    # Remove NAs and duplicates
+    entrez_ids <- unique(na.omit(entrez_ids$ENTREZID))
+    
+    # Capture ENTREZ count
+    n_entrez <- length(entrez_ids)
+    
+    # Update ENTREZ count in summary stats
+    summary_stats$Genes_with_mappedENTREZ[idx] <- n_entrez
+  
+    # Safety check
+    if(n_entrez == 0){
+      message("No ENTREZ IDs mapped for ", direction, " in ", comp_name)
+      skip_messages <- c(skip_messages, paste(direction, "No ENTREZ IDs"))
+      next
+    }
+    
+    cat("    Mapped to", n_entrez, "ENTREZ IDs\n")
+    
+  ## Run KEGG
+    kegg_res <- enrichKEGG(
+      gene = entrez_ids,
+      organism = "sasa",
+      universe = background_entrez,
+      pvalueCutoff = 0.05,
+      pAdjustMethod = "BH",
+      qvalueCutoff = 1
+    )
+
+    # Skip if no enrichment
+    if(is.null(kegg_res) || nrow(as.data.frame(kegg_res)) == 0) {
+    message("No KEGG enrichment for ", direction," in ", comp_name)
+    skip_messages <- c(skip_messages, paste(direction, ":",
+                                            "No KEGG enrichment"))
+      next
+    }
+
+    # Create data frame with KEGG results
+    kegg_df <- data.frame(kegg_res)
+
+    # Capture final number of KEGG paths and significant KEGG paths
+    n_kegg <- nrow(kegg_df)
+    n_kegg_sig <- sum(kegg_df$p.adjust < 0.05)
+    
+    # Update number of KEGG paths and significant KEGG paths in summary stats
+    summary_stats$KEGG_pathways[idx] <- n_kegg
+    summary_stats$KEGG_significant[idx] <- n_kegg_sig
+    
+    # Add direction and -log10 for FDR
+    kegg_df$Direction <- direction
+    kegg_df$logFDR <- -log10(kegg_df$p.adjust)
+
+    ## Function to convert KEGG gene lists to SYMBOLS
+    convert_entrez_to_symbol <- function(entrez_string){
+      entrez <- unlist(strsplit(entrez_string,"/"))
+      genes <- entrez2symbol_map[entrez]
+      genes <- unique(genes)
+      genes <- genes[!is.na(genes)]
+      paste(genes, collapse = ",")
+    }
+
+    # Apply to KEGG results
+    kegg_df$GeneSymbols <- sapply(kegg_df$geneID, convert_entrez_to_symbol)
+    
+    results_list[[direction]] <- kegg_df
+    
+    ## Count SYMBOLs appearing in KEGG results
+    kegg_symbols <- unique(unlist(strsplit(kegg_df$GeneSymbols, ",")))
+
+    kegg_symbols <- kegg_symbols[kegg_symbols != ""]
+    n_symbols <- length(kegg_symbols)
+
+    # Update SYMBOLs from KEGG results in summary stats
+    summary_stats$SYMBOLs_from_KEGGenrich[idx] <- n_symbols
+
+  }
+
+  ## If nothing ran, skip safely
+  if(length(results_list) == 0) {
+    return(list(
+      result = NULL,
+      summary = summary_stats,
+      skipped = TRUE,
+      reason = paste(skip_messages, collapse = " | ")
+   ))
+  }
+
+  ## Combine UP and DOWN results
+  kegg_all <- do.call(rbind, results_list)
+  
+  ## Save individual KEGG results (with gene list) CSV (per comparison)
+  write.csv(kegg_all,
+            file = paste0("KEGG_UP_DOWN_", comp_name, ".csv"),
+            row.names = FALSE)
+
+  ## Create plotting dataset
+  kegg_plot <- kegg_all %>% 
+    group_by(Direction) %>%
+    filter(p.adjust < 0.05) %>%
+    arrange(p.adjust, .by_group = TRUE) %>%
+    slice_head(n = 15) %>% 
+    ungroup()
+
+  ## Create and save TIFF
+  if(nrow(kegg_plot)>0){
+
+  tiff(paste0("KEGG_UP_DOWN_", comp_name, ".tiff"),
+       width = 17, height = 12,
+       units = "in", res = 600)
+
+  print(
+    ggplot(kegg_plot, aes(x = logFDR,
+                         y = reorder(Description, logFDR),
+                         color = Direction,
+                         size = Count)) +
+      geom_point(alpha = 0.8) +
+      facet_wrap(~Direction, scales = "free_y") +
+      theme_minimal(base_size = 14) +
+      scale_color_manual(values = c("DOWN"="steelblue3",
+                                    "UP"="firebrick3")) +
+      scale_size_continuous(range = c(4, 10)) +
+      labs(
+        x = "-log10(FDR)",
+        y = "KEGG pathway",
+        size = "Gene Count",
+        color = "Direction"
+      ) +
+      theme(
+        axis.text.y = element_text(size = 15),
+        axis.text.x = element_text(size = 14),
+        axis.title  = element_text(face = "bold", size = 18),
+        strip.text  = element_text(face = "bold", size = 14),
+        legend.title = element_text(face = "bold", size = 16),
+        legend.text  = element_text(size = 14)
+      )
+  )
+
+  dev.off()
+}  
+
+return(list(
+  result = kegg_all,
+  summary = summary_stats,
+  skipped = FALSE,
+  reason = ifelse(length(skip_messages) > 0,
+                  paste(skip_messages, collapse = " | "),
+                  NA)
+))
+}
+
+
+# Create a list with stored results
+KEGG_results_all <- list()
+
+# Loop over ALL tissues and comparisons
+# Assumes 'tables' is structured as: tables$Tissue$Comparison
+for(tissue in names(tables)) {
+  for(comp in names(tables[[tissue]])) {
+    table_current <- tables[[tissue]][[comp]]
+
+    result <- run_KEGG_pipeline(
+      table = table_current,
+      comp_name = paste(tissue,comp,sep="_"),
+      tissue_name = tissue,  
+      db_object = salmontranscriptcluster.db,
+      entrez2symbol_map = entrez2symbol_map
+    )
+
+    KEGG_results_all[[paste(tissue, comp, sep="_")]] <- result
+  }
+}
+
+## AFTER loop → create debug table
+kegg_log <- data.frame(
+  comparison = names(KEGG_results_all),
+  skipped = sapply(KEGG_results_all, function(x) x$skipped),
+  reason  = sapply(KEGG_results_all, function(x) x$reason)
+)
+
+# Save debug table as CSV
+write.csv(kegg_log, "KEGG_debug_log.csv", row.names = FALSE)
+
+## AFTER loop  → create MASTER summary table
+all_summary <- do.call(rbind, lapply(KEGG_results_all, function(x) x$summary))
+
+# Save master summary as CSV
+write.csv(all_summary,
+            file = "KEGG_summary_AllComparisons.csv",
+            sep = ",",
+            row.names = FALSE,
+            col.names = TRUE,  # Always write headers for master
+            append = FALSE)    # Fresh file, not appending
+
+cat("Completed KEGG analysis for", length(KEGG_results_all), "comparisons\n")
+cat("Master summary saved to: KEGG_summary_AllComparisons.csv\n")
+
+```
+
+
+# Volcano Plot Part 2: Highlight DEG, GO and KEGG in Plot - Single comparison
+This second part of the volcano plotting produces a plot which highlights the
+DEGs, as well as the DEGs with a significant GO and/or KEGG association. As a
+result we get both a plot and a ".csv" file with the list of DEGs that satisfied
+the criteria, for each analyzed comparison.
+
+For easy handling of data we recreate the "tab" object here, similarly to the
+way it was created in the chunk of the first part of the volcano plot.
+```{r Volcano Plot.p2: Highlights in plot - Single}
+
+# SELECT ONE COMPARISON TO TEST
+tissue_test <- "G"   # "B", "L", or "G"
+comp_test   <- "G_T2_IMvsEM"  # must match your tables list
+
+table_test <- tables[[tissue_test]][[comp_test]]
+
+## Print which comparison is being tested
+cat("Running Volcano for:", comp_test, "in", tissue_test, "\n")
+
+## Store skip messages
+skip_messages <- c()
+
+## 2. Define and classify DEGs
+tab <- table_test
+
+tab$diffexpressed <- "NO"
+tab$diffexpressed[tab$logFC >=  2 & tab$adj.P.Val < 0.05] <- "UP"
+tab$diffexpressed[tab$logFC <= -2 & tab$adj.P.Val < 0.05] <- "DOWN"
+
+## 6. LOAD DEGs AND SIGNIFICANT GO/KEGG GENES
+# DEG file
+file_deg  <- paste0("DEG_", tissue_test, "_", comp_test, ".csv")
+
+# Safety check
+if(!file.exists(file_deg)){
+  skip_messages <- c(skip_messages,"Missing DEG file")}
+
+if(file.exists(file_deg)){
+  deg <- read.csv(file_deg)
+  deg_clean <- deg[!is.na(deg$SYMBOL), ]
+  # Order data
+  deg_clean <- deg_clean[
+    order(
+      deg_clean$diffexpressed, # Order alphabetically
+      deg_clean$adj.P.Val,     # Then: smallest FDR first
+      -abs(deg_clean$logFC)),]    # Then: largest effect size first
+    cat("DEGs loaded:", length(file_deg), "\n")
+} else {
+  deg_clean <- character(0)
+}
+
+# GO file
+file_go <- paste0("topGO_UP_DOWN_", tissue_test, "_", comp_test, ".csv")
+
+# Safety check
+if(file.exists(file_go)){
+  go <- read.csv(file_go)
+  go_sig <- go[go$Fisher.elim < 0.05, ]
+
+if(nrow(go_sig) == 0){
+  skip_messages <- c(skip_messages, "No significant GO terms")
+  go_genes <- character(0)
+} else {
+  go_genes <- trimws(na.omit(unlist(strsplit(go_sig$GeneSymbols, ","))))
+    cat("GO genes loaded:", length(go_genes), "\n")
+}
+  }
+
+# KEGG file
+file_kegg <- paste0("KEGG_UP_DOWN_", tissue_test, "_", comp_test, ".csv")
+
+if(file.exists(file_kegg)){
+  kegg <- read.csv(file_kegg)
+  kegg_genes <- trimws(na.omit(unlist(strsplit(kegg$GeneSymbols, ","))))
+    cat("KEGG genes loaded:", length(kegg_genes), "\n")
+} else {
+  kegg_genes <- character(0)
+}
+
+cat("GO genes before highlighting:", length(go_genes), "\n")
+cat("KEGG genes before highlighting:", length(kegg_genes), "\n")
+
+## 7. HIGHLIGHT CATEGORIES
+tab$Highlight <- "None"
+
+tab$Highlight[tab$SYMBOL %in% go_genes] <- "GO"
+
+tab$Highlight[tab$SYMBOL %in% kegg_genes] <- "KEGG"
+
+tab$Highlight[tab$SYMBOL %in% intersect(go_genes, kegg_genes)] <- "GO+KEGG"
+
+## 8. Labels (top 10 UP / DOWN)
+# Extract top symbols directly from ordered clean table
+top_up_symbols <- deg_clean$SYMBOL[
+  deg_clean$diffexpressed == "UP"
+][1:min(10, sum(deg_clean$diffexpressed == "UP"))]
+
+top_down_symbols <- deg_clean$SYMBOL[
+  deg_clean$diffexpressed == "DOWN"
+][1:min(10, sum(deg_clean$diffexpressed == "DOWN"))]
+
+# Combine
+top_symbols <- unique(c(top_up_symbols, top_down_symbols))
+
+# Assign labels and avoid NAs
+tab$delabel <- ifelse(tab$SYMBOL %in% top_symbols, tab$SYMBOL, NA)
+
+# Create highlighted subset from the top10 labeled symbols
+highlighted_genes <- tab[tab$Highlight != "None" & !is.na(tab$delabel),]
+
+## Safety check — no SYMBOLs
+if(all(is.na(tab$delabel))){
+  skip_messages <- c(skip_messages, "No symbols for labeling")
+}
+
+## 9. Volcano plot
+tiff(paste0("3JulVolcano_", tissue_test, "_", comp_test, ".tiff"),
+     width = 3000, height = 3000, res = 300)
+
+p <- ggplot(
+  tab,
+  aes(x = logFC,
+      y = -log10(adj.P.Val),
+      col = diffexpressed,
+      label = delabel)
+) +
+  geom_vline(xintercept = c(-2, 2), linetype = "dashed", color = "gray") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray") +
+  geom_point(size = 2) +
+  geom_point(data = highlighted_genes, inherit.aes = FALSE,
+  aes(
+    x = logFC,
+    y = -log10(adj.P.Val),
+    shape = Highlight), size = 4, stroke = 1.2, color = "black") +
+  geom_text_repel(max.overlaps = Inf) +
+  scale_color_manual(values = c("DOWN"="#00AFBB","NO"="grey","UP"="firebrick3"), labels = c("Down regulated","Not significant","Up regulated")) +
+  scale_shape_manual(values = c("GO" = 17,"KEGG" = 15,"GO+KEGG" = 8)) +
+  labs(
+    x = expression("log"[2]*"FC"),
+    y = expression("-log"[10]*"FDR"),
+    color = "Gene expression", shape =  "Functional Annotation") +
+  theme_classic(base_size = 20) +
+  theme(axis.title = element_text(face = "bold"))
+
+print(p)
+dev.off()
+
+## 8. Save debug
+# Create debug table
+volcano_log_single <- data.frame(
+  comparison = paste(tissue_test, comp_test, sep="_"),
+  skipped = length(skip_messages) > 0,
+  reason = ifelse(length(skip_messages) > 0,
+                  paste(skip_messages, collapse = " | "),
+                  NA)
+)
+
+# Save debug CSV
+write.csv(volcano_log_single,
+          file = "3JulVolcano_debug_singleV2.csv",
+            sep = ",",
+            row.names = FALSE,
+            col.names = !file.exists("3JulVolcano_debug_singleV2.csv"),
+            append = TRUE)
+
+```
+
+
+# Volcano Plot Part 2: Highlight DEG/GO/KEGG in Plot - Loop over all comparisons
+Here we repeat the volcano plotting in a loop that processes all comparisons.
+```{r Volcano Plot.p2: Highlights in plot - Loop}
+
+# A reusable volcano-plot function
+make_volcano <- function(tab, comparison_name, tissue, backgrounds, db_object) {
+    
+    # Print to see which comparison is being processed
+    cat("Running Volcano for:", comparison_name, "in", tissue, "\n")
+  
+    # Store skip messages
+    skip_messages <- c()
+    
+    ## 2. Define and classify DEGs
+    tab$diffexpressed <- "NO"
+    tab$diffexpressed[tab$logFC >=  2 & tab$adj.P.Val < 0.05] <- "UP"
+    tab$diffexpressed[tab$logFC <= -2 & tab$adj.P.Val < 0.05] <- "DOWN"
+    
+    ## 6. LOAD DEGs AND SIGNIFICANT GO/KEGG GENES
+    # DEG file
+    file_deg  <- paste0("DEG_", comparison_name, ".csv")
+
+    # Safety check
+    if(!file.exists(file_deg)){
+      skip_messages <- c(skip_messages,"Missing DEG file")
+      return(list(
+        skipped = TRUE,
+        reason = "Missing DEG file"))
+      }
+    
+    if(file.exists(file_deg)){
+      deg <- read.csv(file_deg)
+      deg_clean <- deg[!is.na(deg$SYMBOL), ]
+      # Order data
+      deg_clean <- deg_clean[
+        order(
+         deg_clean$diffexpressed, # Order alphabetically
+          deg_clean$adj.P.Val,     # Then: smallest FDR first
+          -abs(deg_clean$logFC)),]    # Then: largest effect size first
+        cat("DEGs loaded:", nrow(deg_clean), "\n")
+    } else {
+     deg_clean <- character(0)
+    }
+    
+    # GO file
+    file_go <- paste0("topGO_UP_DOWN_", comparison_name, ".csv")
+
+    if(file.exists(file_go)){
+      go <- read.csv(file_go)
+      go_sig <- go[go$Fisher.elim < 0.05, ]
+  
+      ## Safety check
+      if(nrow(go_sig) == 0){
+        skip_messages <- c(skip_messages, "No significant GO terms")
+      go_genes <- character(0)
+      } else {
+      go_genes <- trimws(na.omit(unlist(strsplit(go_sig$GeneSymbols, ","))))
+        cat("GO genes loaded:", length(go_genes), "\n")
+    }
+    }
+
+    # KEGG file
+    file_kegg <- paste0("KEGG_UP_DOWN_", comparison_name, ".csv")
+
+   if(file.exists(file_kegg)){
+    kegg <- read.csv(file_kegg)
+    kegg_genes <- trimws(na.omit(unlist(strsplit(kegg$GeneSymbols, ","))))
+      cat("KEGG genes loaded:", length(kegg_genes), "\n")
+    } else {
+      kegg_genes <- character(0)
+    }
+
+    cat("GO genes before highlighting:", length(go_genes), "\n")
+    cat("KEGG genes before highlighting:", length(kegg_genes), "\n")
+
+    ## 7. HIGHLIGHT CATEGORIES
+    tab$Highlight <- "None"
+
+    tab$Highlight[tab$SYMBOL %in% go_genes] <- "GO"
+
+    tab$Highlight[tab$SYMBOL %in% kegg_genes] <- "KEGG"
+
+    tab$Highlight[tab$SYMBOL %in% intersect(go_genes, kegg_genes)] <- "GO+KEGG"
+
+
+    ## 8. Labels (top 10 per direction UP/DOWN)
+    # Extract top 10 symbols directly from ordered clean table
+    top_up_symbols <- deg_clean$SYMBOL[
+      deg_clean$diffexpressed == "UP"
+    ][1:min(10, sum(deg_clean$diffexpressed == "UP"))]
+
+    top_down_symbols <- deg_clean$SYMBOL[
+      deg_clean$diffexpressed == "DOWN"
+    ][1:min(10, sum(deg_clean$diffexpressed == "DOWN"))]
+
+    # Combine
+    top_symbols <- unique(c(top_up_symbols, top_down_symbols))
+    
+    # Assign labels and avoid NAs
+    tab$delabel <- ifelse(tab$SYMBOL %in% top_symbols, tab$SYMBOL, NA)
+    
+    # Create highlighted subset from the top10 labeled symbols
+    highlighted_genes <- tab[tab$Highlight != "None" & !is.na(tab$delabel),]
+
+  
+    ## Safety check — no SYMBOLs
+    if(all(is.na(tab$delabel))){
+      skip_messages <- c(skip_messages, "No symbols for labeling")
+      return(list(
+        skipped = TRUE,
+        reason = "No symbols for labeling"
+      ))
+      }
+
+    
+    ## 9. Volcano plot
+    tiff(paste0("Volcano_", comparison_name, ".tiff"),
+         width = 3000, height = 3000, res = 300)
+
+    p <- ggplot(
+      tab,
+      aes(x = logFC,
+          y = -log10(adj.P.Val),
+          col = diffexpressed,
+          label = delabel)
+    ) +
+      geom_vline(xintercept = c(-2, 2), linetype = "dashed", color = "gray") +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray") +
+      geom_point(size = 2) +
+      geom_point(data = highlighted_genes, inherit.aes = FALSE,
+      aes(
+        x = logFC,
+        y = -log10(adj.P.Val),
+        shape = Highlight), size = 4, stroke = 1.2, color = "black") + 
+      geom_text_repel(max.overlaps = Inf) +
+      scale_color_manual(values = c("DOWN"="#00AFBB", "NO"="grey", "UP"="firebrick3"), labels = c("Down regulated","Not significant","Up regulated")) +
+      scale_shape_manual(values = c("GO" = 17,"KEGG" = 15,"GO+KEGG" = 8)) +
+      labs(
+        x = expression("log"[2]*"FC"),
+        y = expression("-log"[10]*"FDR"),
+        color = "Gene expression",
+        shape =  "Functional Annotation") +
+      theme_classic(base_size = 20) +
+      theme(
+       axis.title = element_text(face = "bold"))
+
+   print(p)
+   dev.off()
+
+    return(list(
+      skipped = FALSE,
+      reason = ifelse(length(skip_messages)>0,
+                      paste(skip_messages, collapse=" | "),
+                      NA)
+    ))
+}
+
+
+## Loop over ALL tissues and all comparisons
+volcano_results_all <- list()
+
+for (tissue in names(tables)) {
+  for (comp in names(tables[[tissue]])) {
+
+    result <- make_volcano(
+      tab = tables[[tissue]][[comp]],
+      comparison_name = paste(tissue, comp, sep="_"),
+      tissue = tissue,
+      backgrounds = backgrounds,
+      db_object = salmontranscriptcluster.db
+    )
+
+    volcano_results_all[[paste(tissue, comp, sep="_")]] <- result
+  }
+}
+
+
+## AFTER loop → create debug table
+volcano_log <- data.frame(
+  comparison = names(volcano_results_all),
+  skipped = sapply(volcano_results_all, function(x) x$skipped),
+  reason  = sapply(volcano_results_all, function(x) x$reason)
+)
+
+# Save debug table as CSV
+write.csv(volcano_log, "Volcano_debug_logV2.csv", row.names = FALSE)
+```
+
+
+# Gene Associations - Gene Overlaps and High-Confidence Genes
+Once we defined DEGs and performed the functional analysis we have sufficient
+annotation information about our DEGs to use it to find genes that overlap
+between our DEG, GO and KEGG analysis results, aiming to find "High-Confidence"
+or well annotated genes, which we can more confidently associated to early
+sexual maturation in Atlantic salmon males.
+
+## Gene Overlaps (Volcano vs GO vs KEGG) - Single comparison
+Here we obtain a ".csv" file with both the UP and DOWN regulated DEGs, and it
+indicates which of those DEGs also have a significant GO and/or KEGG annotation.
+```{r Gene Associations: Gene Overlaps - Single}
+
+## SELECT ONE COMPARISON
+tissue_test <- "G"
+comp_test   <- "G_T2_IMvsEM"
+
+comp_name <- paste(tissue_test, comp_test, sep = "_")
+
+# To print which comparison is being tested
+cat("Checking:", comp_name, "\n")
+
+## Store messages
+skip_messages <- c()
+
+## File names
+file_deg  <- paste0("DEG_", comp_name, ".csv")
+file_go   <- paste0("topGO_UP_DOWN_", comp_name, ".csv")
+file_kegg <- paste0("KEGG_UP_DOWN_", comp_name, ".csv")
+
+
+## 1. LOAD FILES, EXTRACT AND SPLIT DATA BY DIRECTION
+## DEG (Volcano)
+if(!file.exists(file_deg)){
+  skip_messages <- c(skip_messages, "Missing DEG file")
+  message("Missing DEG file")
+  deg_up_genes <- character(0)
+  deg_down_genes <- character(0)
+} else {
+  deg <- read.csv(file_deg)
+    
+  # Inspect
+  cat("DEG rows:", nrow(deg), "\n")
+
+if(any(deg$diffexpressed == "UP")){
+  deg_up_genes <- unique(na.omit(deg$SYMBOL[deg$diffexpressed == "UP"]))
+  } 
+  
+if(any(deg$diffexpressed == "DOWN")){
+  deg_down_genes <- unique(na.omit(deg$SYMBOL[deg$diffexpressed == "DOWN"]))
+  }
+  
+cat("UP DEGs:", length(deg_up_genes), "\n")
+cat("DOWN DEGs:", length(deg_down_genes), "\n")
+}
+
+## GO
+if(!file.exists(file_go)){
+  skip_messages <- c(skip_messages, "Missing GO file")
+  message("Missing GO file")
+  go_up_genes <- character(0)
+  go_down_genes <- character(0)
+} else {
+  go <- read.csv(file_go)
+  
+  # KEEP ONLY SIGNIFICANT GO TERMS
+  go_sig <- go[go$Fisher.elim < 0.05, ]
+  
+  cat("GO rows:", nrow(go), "\n")
+  
+  # Safety check
+  if(nrow(go_sig) == 0){
+    skip_messages <- c(skip_messages, "No significant GO terms")
+    go_up_genes <- character(0)
+    go_down_genes <- character(0)
+  } else {
+  
+  # Split comma-separated symbols
+  if(any(go_sig$Direction == "UP")){
+    go_up_genes <- unique(
+      na.omit(
+        unlist(strsplit(go_sig$GeneSymbols[go_sig$Direction == "UP"], ","))))
+    } 
+  
+  if(any(go_sig$Direction == "DOWN")){
+    go_down_genes <- unique(
+      na.omit(
+        unlist(strsplit(go_sig$GeneSymbols[go_sig$Direction == "DOWN"], ","))))
+    }
+    
+  cat("GO UP genes:", length(go_up_genes), "\n")
+  cat("GO DOWN genes:", length(go_down_genes), "\n")
+  }
+  }
+
+## KEGG
+if(!file.exists(file_kegg)){
+  skip_messages <- c(skip_messages, "Missing KEGG file")
+  message("Missing KEGG file")
+  kegg_up_genes <- character(0)
+  kegg_down_genes <- character(0)
+} else {
+  kegg <- read.csv(file_kegg)
+  
+  cat("KEGG rows:", nrow(kegg), "\n")
+  
+  # Split comma-separated symbols
+if(any(kegg$Direction == "UP")){
+  kegg_up_genes <- unique(
+    na.omit(
+      unlist(strsplit(kegg$GeneSymbols[kegg$Direction == "UP"], ","))))
+  } 
+  
+if(any(kegg$Direction == "DOWN")){
+  kegg_down_genes <- unique(
+    na.omit(
+      unlist(strsplit(kegg$GeneSymbols[kegg$Direction == "DOWN"], ","))))
+}
+  
+cat("KEGG UP genes:", length(kegg_up_genes), "\n")
+cat("KEGG DOWN genes:", length(kegg_down_genes), "\n")
+}
+
+
+## 2. DIRECTION-SPECIFIC OVERLAPS
+## UP overlaps
+up_volc_go <- intersect(deg_up_genes, go_up_genes)
+up_volc_kegg <- intersect(deg_up_genes, kegg_up_genes)
+up_go_kegg <- intersect(go_up_genes, kegg_up_genes)
+
+up_all_three <- Reduce(
+  intersect,
+  list(
+    deg_up_genes,
+    go_up_genes,
+    kegg_up_genes
+  )
+)
+
+## DOWN overlaps
+down_volc_go <- intersect(deg_down_genes, go_down_genes)
+down_volc_kegg <- intersect(deg_down_genes, kegg_down_genes)
+down_go_kegg <- intersect(go_down_genes, kegg_down_genes)
+
+down_all_three <- Reduce(
+  intersect,
+  list(
+    deg_down_genes,
+    go_down_genes,
+    kegg_down_genes
+  )
+)
+
+
+
+## 3. SUMMARY TABLE
+summary_checker <- data.frame(
+  Comparison = comp_name,
+  Tissue = tissue_test,
+  
+  ## UP
+  Volcano_UP = length(deg_up_genes),
+  GO_UP = length(go_up_genes),
+  KEGG_UP = length(kegg_up_genes),
+
+  Volcano_GO_UP = length(up_volc_go),
+  Volcano_KEGG_UP = length(up_volc_kegg),
+  GO_KEGG_UP = length(up_go_kegg),
+  All_three_UP = length(up_all_three),
+  
+  ## DOWN
+  Volcano_DOWN = length(deg_down_genes),
+  GO_DOWN = length(go_down_genes),
+  KEGG_DOWN = length(kegg_down_genes),
+
+  Volcano_GO_DOWN = length(down_volc_go),
+  Volcano_KEGG_DOWN = length(down_volc_kegg),
+  GO_KEGG_DOWN = length(down_go_kegg),
+  All_three_DOWN = length(down_all_three),
+  
+  skipped = ifelse(length(skip_messages)>0, TRUE, FALSE),
+  reason = ifelse(length(skip_messages)>0,
+                  paste(skip_messages, collapse=" | "),
+                  NA)
+)
+
+print(summary_checker)
+
+# Save CSV
+write.csv(summary_checker,
+          file = "8maySummaryChecker_ALL.csv",
+          row.names = FALSE,
+          col.names = !file.exists("8maySummaryChecker_ALL.csv"),
+          append = TRUE)
+
+## 4. SAVE OVERLAP GENE TABLE
+overlap_list <- list(
+  ## UP
+  Volcano_UP = deg_up_genes,
+  GO_UP = go_up_genes,
+  KEGG_UP = kegg_up_genes,
+
+  Volcano_GO_UP = up_volc_go,
+  Volcano_KEGG_UP = up_volc_kegg,
+  GO_KEGG_UP = up_go_kegg,
+  All_three_UP = up_all_three,
+  
+  ## DOWN
+  Volcano_DOWN = deg_down_genes,
+  GO_DOWN = go_down_genes,
+  KEGG_DOWN = kegg_down_genes,
+
+  Volcano_GO_DOWN = down_volc_go,
+  Volcano_KEGG_DOWN = down_volc_kegg,
+  GO_KEGG_DOWN = down_go_kegg,
+  All_three_DOWN = down_all_three
+)
+
+# Make equal-length columns
+max_len <- max(sapply(overlap_list, length))
+
+overlap_df <- as.data.frame(lapply(overlap_list, function(x){
+  length(x) <- max_len
+  return(x)
+}))
+
+# Inspect
+head(overlap_df)
+
+# Save CSV
+write.csv(overlap_df,
+          file = paste0("GeneOverlap_", comp_name, ".csv"),
+          row.names = FALSE)
+
+```
+
+
+## Gene Overlaps (Volcano vs GO vs KEGG) - Loop over all comparisons
+Here we repeat the analysis in a loop that processes all comparisons.
+```{r Gene Associations: Gene Overlaps – Loop}
+
+## Store all results
+checker_results_all <- list()
+
+## Loop over ALL tissues and comparisons
+for (tissue in names(tables)) {
+  for (comp in names(tables[[tissue]])) {
+    
+    comp_name <- paste(tissue, comp, sep = "_")
+    
+    cat("\n=============================\n")
+    cat("Checking:", comp_name, "\n")
+    cat("=============================\n")
+    
+    ## Store messages
+    skip_messages <- c()
+    
+    ## File names
+    file_deg  <- paste0("DEG_", comp_name, ".csv")
+    file_go   <- paste0("topGO_UP_DOWN_", comp_name, ".csv")
+    file_kegg <- paste0("KEGG_UP_DOWN_", comp_name, ".csv")
+    
+    ## Safety check — all files missing
+    if(
+      !file.exists(file_deg) &
+      !file.exists(file_go) &
+      !file.exists(file_kegg)
+    ){
+      skip_messages <- c(skip_messages, "All files missing")
+    }
+    
+    ## 1. LOAD FILES, EXTRACT AND SPLIT DATA BY DIRECTION
+    ## DEG
+    if(!file.exists(file_deg)){
+      skip_messages <- c(skip_messages, "Missing DEG file")
+      message("Missing DEG file")
+      deg_up_genes <- character(0)
+      deg_down_genes <- character(0)
+    } else {
+      deg <- read.csv(file_deg)
+      
+      deg_up_genes <- character(0)
+      deg_down_genes <- character(0)
+    
+    if(any(deg$diffexpressed == "UP")){
+      deg_up_genes <- unique(na.omit(deg$SYMBOL[deg$diffexpressed == "UP"]))
+      } 
+    
+    if(any(deg$diffexpressed == "DOWN")){
+      deg_down_genes <- unique(na.omit(deg$SYMBOL[deg$diffexpressed == "DOWN"]))
+      }
+    }
+
+    
+    ## GO
+    if(!file.exists(file_go)){
+      skip_messages <- c(skip_messages, "Missing GO file")
+      message("Missing GO file")
+      go_up_genes <- character(0)
+      go_down_genes <- character(0)
+    } else {
+      go <- read.csv(file_go)
+      
+    # KEEP ONLY SIGNIFICANT GO TERMS
+      go_sig <- go[go$Fisher.elim < 0.05, ]
+      
+    # Safety check
+    if(nrow(go_sig) == 0){
+      skip_messages <- c(skip_messages, "No significant GO terms")
+      go_up_genes <- character(0)
+      go_down_genes <- character(0)
+    } else {
+      
+      go_up_genes <- character(0)
+      go_down_genes <- character(0)
+
+    # Split comma-separated symbols
+    if(any(go_sig$Direction == "UP")){
+      go_up_genes <- unique(na.omit(
+        unlist(strsplit(go_sig$GeneSymbols[go_sig$Direction == "UP"], ","))))
+    } 
+      
+    if(any(go_sig$Direction == "DOWN")){
+      go_down_genes <- unique(na.omit(
+        unlist(strsplit(go_sig$GeneSymbols[go_sig$Direction == "DOWN"], ","))))
+    }
+    }
+    }
+    
+    ## KEGG
+    if(!file.exists(file_kegg)){
+      skip_messages <- c(skip_messages, "Missing KEGG file")
+      message("Missing KEGG file")
+      kegg_up_genes <- character(0)
+      kegg_down_genes <- character(0)
+    } else {
+      kegg <- read.csv(file_kegg)
+      
+      kegg_up_genes <- character(0)
+      kegg_down_genes <- character(0)
+      
+    # Split comma-separated symbols
+    if(any(kegg$Direction == "UP")){
+      kegg_up_genes <- unique(na.omit(
+        unlist(strsplit(kegg$GeneSymbols[kegg$Direction == "UP"], ","))))
+    }
+     
+    if(any(kegg$Direction == "DOWN")){
+      kegg_down_genes <- unique(na.omit(
+        unlist(strsplit(kegg$GeneSymbols[kegg$Direction == "DOWN"], ","))))
+      }
+    }
+    
+    ## 2. DIRECTION-SPECIFIC OVERLAPS
+    ## UP overlaps
+    up_volc_go <- intersect(deg_up_genes, go_up_genes)
+    up_volc_kegg <- intersect(deg_up_genes, kegg_up_genes)
+    up_go_kegg <- intersect(go_up_genes, kegg_up_genes)
+
+    up_all_three <- Reduce(
+      intersect,
+      list(
+        deg_up_genes,
+        go_up_genes,
+        kegg_up_genes))
+    
+    ## DOWN overlaps
+    down_volc_go <- intersect(deg_down_genes, go_down_genes)
+    down_volc_kegg <- intersect(deg_down_genes, kegg_down_genes)
+    down_go_kegg <- intersect(go_down_genes, kegg_down_genes)
+
+    down_all_three <- Reduce(
+      intersect,
+      list(
+        deg_down_genes,
+        go_down_genes,
+        kegg_down_genes))
+
+    
+    ## 3. SUMMARY TABLE
+    summary_checker <- data.frame(
+      Comparison = comp_name,
+      Tissue = tissue,
+      
+      ## UP
+      Volcano_UP = length(deg_up_genes),
+      GO_UP = length(go_up_genes),
+      KEGG_UP = length(kegg_up_genes),
+      
+      Volcano_GO_UP = length(up_volc_go),
+      Volcano_KEGG_UP = length(up_volc_kegg),
+      GO_KEGG_UP = length(up_go_kegg),
+      All_three_UP = length(up_all_three),
+
+      ## DOWN
+      Volcano_DOWN = length(deg_down_genes),
+      GO_DOWN = length(go_down_genes),
+      KEGG_DOWN = length(kegg_down_genes),
+      
+      Volcano_GO_DOWN = length(down_volc_go),
+      Volcano_KEGG_DOWN = length(down_volc_kegg),
+      GO_KEGG_DOWN = length(down_go_kegg),
+      All_three_DOWN = length(down_all_three),
+      
+      skipped = ifelse(length(skip_messages)>0, TRUE, FALSE),
+      reason = ifelse(length(skip_messages)>0,
+                      paste(skip_messages, collapse=" | "),
+                      NA)
+    )
+    
+    
+    ## 4. SAVE OVERLAP TABLE
+    overlap_list <- list(
+      ## UP
+      Volcano_UP = deg_up_genes,
+      GO_UP = go_up_genes,
+      KEGG_UP = kegg_up_genes,
+      
+      Volcano_GO_UP = up_volc_go,
+      Volcano_KEGG_UP = up_volc_kegg,
+      GO_KEGG_UP = up_go_kegg,
+      All_three_UP = up_all_three,
+      
+      ## DOWN
+      Volcano_DOWN = deg_down_genes,
+      GO_DOWN = go_down_genes,
+      KEGG_DOWN = kegg_down_genes,
+      
+      Volcano_GO_DOWN = down_volc_go,
+      Volcano_KEGG_DOWN = down_volc_kegg,
+      GO_KEGG_DOWN = down_go_kegg,
+      All_three_DOWN = down_all_three)
+    
+    # Make equal-length columns
+    max_len <- max(sapply(overlap_list, length))
+    
+    overlap_df <- as.data.frame(lapply(overlap_list, function(x){
+      length(x) <- max_len
+      return(x)
+    }))
+    
+    write.csv(overlap_df,
+              file = paste0("GeneOverlap_", comp_name, ".csv"),
+              row.names = FALSE)
+    
+    ## STORE RESULTS
+    checker_results_all[[comp_name]] <- list(
+      summary = summary_checker,
+      skipped = summary_checker$skipped,
+      reason = summary_checker$reason
+    )
+  }
+}
+    
+    ## AFTER LOOP → MASTER SUMMARY TABLE
+    all_summary_checker <- do.call(rbind,
+      lapply(checker_results_all, function(x) x$summary))
+
+    # Save CSV
+    write.csv(all_summary_checker,
+      file = "SummaryChecker_ALL.csv",
+      sep = ",",
+      row.names = FALSE,
+      col.names = TRUE, # Always write headers for master
+      append = FALSE) # Fresh file, not appending
+
+```
+
+
+
+## High-Confidence Genes (Volcano vs GO vs KEGG) - Single comparison
+Here we obtain two ".csv" files. The first file includes both the UP and DOWN
+regulated DEGs, it indicates if those DEGs had also significant GO and/or KEGG
+annotation, and in contrast with the Gene Overlap file, this file also includes
+statistical data for each DEG, such as FDR, logFC, its p.value for GO,
+p.adjusted for KEGG, as well as a column specifying GO terms and KEGG paths
+associated with each DEG.
+The second file obtained here, which includes the exact same columns as the
+first one, only contains the filtered DEGs that have at least another functional
+annotation different than that of the gene, either in GO terms or KEGG pathways.
+```{r Gene Associations: High-Confidence – Single}
+
+## SELECT COMPARISON
+tissue_test <- "G"
+comp_test   <- "G_T2_IMvsEM"
+
+comp_name <- paste(tissue_test, comp_test, sep = "_")
+
+# To print which comparison is being tested
+cat("Building integrative table for:", comp_name, "\n")
+
+## Store messages
+skip_messages <- c()
+
+## File names
+file_deg  <- paste0("DEG_", comp_name, ".csv")
+file_go   <- paste0("topGO_UP_DOWN_", comp_name, ".csv")
+file_kegg <- paste0("KEGG_UP_DOWN_", comp_name, ".csv")
+
+## 1. LOAD DATA
+## DEG
+if(!file.exists(file_deg)){
+  stop(paste("Missing DEG file:", file_deg))
+}
+
+deg  <- read.csv(file_deg)
+
+## GO
+if(!file.exists(file_go)){
+  skip_messages <- c(skip_messages, "Missing GO file")
+  message("Missing GO file")
+  go <- NULL
+} else {
+  go <- read.csv(file_go)
+}
+
+
+if(!file.exists(file_kegg)){
+  skip_messages <- c(skip_messages, "Missing KEGG file")
+  message("Missing KEGG file")
+  kegg <- NULL
+} else {
+  kegg <- read.csv(file_kegg)
+}
+
+
+## 2. CLEAN DEG TABLE
+# Clean DEG table
+deg_clean <- deg[!is.na(deg$SYMBOL) &
+  deg$SYMBOL != "", ]
+
+# Keep only relevant columns
+deg_clean <- deg_clean[, c("SYMBOL","logFC","adj.P.Val","diffexpressed")]
+
+# Rename for clarity
+colnames(deg_clean) <- c("SYMBOL","logFC","FDR","Direction")
+
+
+## 3. BUILD GO MAPPING
+if(is.null(go)){
+  go_agg <- data.frame(
+    SYMBOL = character(),
+    Direction = character(),
+    GO_ID = character(),
+    GO_Term = character(),
+    GO_pvalue = character()
+  )
+} else {
+  
+  ## KEEP ONLY SIGNIFICANT TERMS
+  go_sig <- go[
+    go$Fisher.elim < 0.05,
+  ]
+  
+  cat("Significant GO terms:", nrow(go_sig), "\n")
+  
+  ## Safety check
+  if(nrow(go_sig) == 0){
+    skip_messages <- c(
+      skip_messages,
+      "No significant GO terms")
+    
+    go_agg <- data.frame(
+      SYMBOL = character(),
+      Direction = character(),
+      GO_ID = character(),
+      GO_Term = character(),
+      GO_pvalue = character())
+  } else {
+    
+    ## Split GeneSymbols column
+    go_sig$GeneList <- strsplit(
+      as.character(go_sig$GeneSymbols), ",")
+    
+    ## Expand GO table
+     # Stack all data frames created per each row of GO term
+    go_expanded <- do.call(
+      rbind,
+      lapply(
+        1:nrow(go_sig),
+        function(i){
+          
+          # To return if there are no results
+          if(is.na(go_sig$GeneSymbols[i])){
+            return(NULL)
+          }
+          
+          # To remove spaces (trimws) and list structure (unlist)
+          genes <- trimws(
+            unlist(go_sig$GeneList[i])
+          )
+          
+          # To add data to data frame
+          data.frame(
+            SYMBOL = genes,
+            Direction = go_sig$Direction[i],
+            GO_ID = go_sig$GO.ID[i],
+            GO_Term = go_sig$Term[i],
+            GO_pvalue = go_sig$Fisher.elim[i],
+            stringsAsFactors = FALSE)
+        }
+      )
+    )
+    
+    ## Safety check
+    if(is.null(go_expanded) ||
+      nrow(go_expanded) == 0){
+      
+      go_agg <- data.frame(
+        SYMBOL = character(),
+        Direction = character(),
+        GO_ID = character(),
+        GO_Term = character(),
+        GO_pvalue = character())
+    } else {
+      
+      ## Aggregate per SYMBOL + Direction, avoids duplic.DEG rows, gene per row
+      go_agg <- aggregate(
+        . ~ SYMBOL + Direction,
+        data = go_expanded,
+        FUN = function(x){
+          paste(unique(x), collapse = ",")
+        }
+      )
+      
+      cat("Genes represented in significant GO terms:", nrow(go_agg),"\n")
+    }
+  }
+}
+
+
+
+## 4. BUILD KEGG MAPPING
+if(is.null(kegg)){
+  
+  kegg_agg <- data.frame(
+    SYMBOL = character(),
+    Direction = character(),
+    KEGG_ID = character(),
+    KEGG_Pathway = character(),
+    KEGG_padj = character())
+} else {
+  
+  ## Split GeneSymbols column
+  kegg$GeneList <- strsplit(
+    as.character(kegg$GeneSymbols), ",")
+  
+  ## Expand KEGG table
+  # Stack all data frames created per each row of KEGG pathway
+  kegg_expanded <- do.call(
+    rbind,
+    lapply(
+      1:nrow(kegg),
+      function(i){
+        
+        # To return if there are no results
+        if(is.na(kegg$GeneSymbols[i])){
+          return(NULL)
+        }
+        
+        # To remove spaces (trimws) and list structure (unlist)
+        genes <- trimws(
+          unlist(kegg$GeneList[i]))
+        
+        # To add data to data frame
+        data.frame(
+          SYMBOL = genes,
+          Direction = kegg$Direction[i],
+          KEGG_ID = kegg$ID[i],
+          KEGG_Pathway = kegg$Description[i],
+          KEGG_padj = kegg$p.adjust[i],
+          stringsAsFactors = FALSE)
+      }
+    )
+  )
+
+  ## Safety check
+  if(is.null(kegg_expanded) ||
+    nrow(kegg_expanded) == 0){
+    
+    kegg_agg <- data.frame(
+      SYMBOL = character(),
+      Direction = character(),
+      KEGG_ID = character(),
+      KEGG_Pathway = character(),
+      KEGG_padj = character())
+  } else {
+  
+  ## Aggregate per SYMBOL + Direction, avoids duplicated DEG rows, gene per row
+    kegg_agg <- aggregate(
+      . ~ SYMBOL + Direction,
+      data = kegg_expanded,
+      FUN = function(x){
+        paste(unique(x), collapse = ",")
+      }
+    )
+    
+    cat("Genes represented in KEGG pathways:", nrow(kegg_agg),"\n")
+  }
+}
+
+
+## 5. MERGE EVERYTHING
+## Merge GO
+deg_annot <- merge(
+  deg_clean,
+  go_agg,
+  by = c(
+    "SYMBOL",
+    "Direction"
+  ),
+  all.x = TRUE)
+
+## Merge KEGG
+deg_annot <- merge(
+  deg_annot,
+  kegg_agg,
+  by = c(
+    "SYMBOL",
+    "Direction"
+  ),
+  all.x = TRUE)
+
+
+## 6. ADD COUNTS
+deg_annot$N_GO_terms <- ifelse(
+  is.na(deg_annot$GO_ID),
+  0,
+  lengths(
+    strsplit(
+      deg_annot$GO_ID,
+      ",")))
+
+deg_annot$N_KEGG_paths <- ifelse(
+  is.na(deg_annot$KEGG_ID),
+  0,
+  lengths(
+    strsplit(
+      deg_annot$KEGG_ID,
+      ",")))
+
+
+## 7. ADD FLAGS
+deg_annot$In_GO <- !is.na(deg_annot$GO_ID)
+
+deg_annot$In_KEGG <- !is.na(deg_annot$KEGG_ID)
+
+deg_annot$In_GO_KEGG <-
+  deg_annot$In_GO &
+  deg_annot$In_KEGG
+
+## 7.1. SUPPORT COUNT COLUMN
+# All genes in this table are DEGs
+deg_annot$Volcano <- TRUE
+
+# Count evidence sources
+deg_annot$Support_Count <-
+  as.numeric(deg_annot$Volcano) +
+  as.numeric(deg_annot$In_GO) +
+  as.numeric(deg_annot$In_KEGG)
+
+
+## 8. ADD METADATA
+deg_annot$Tissue <- tissue_test
+
+deg_annot$Comparison <- comp_name
+
+deg_annot$Notes <- ifelse(
+  length(skip_messages) > 0,
+  paste(skip_messages, collapse = " | "),
+  NA
+)
+
+
+## 9. ORDER AND SAVE FULL INTEGRATIVE TABLE
+# Order columns
+deg_annot <- deg_annot[, c(
+  "Tissue",
+  "Comparison",
+  "SYMBOL",
+  "Direction",
+  "FDR",
+  "logFC",
+  "Support_Count",
+  "Volcano",
+  "In_GO",
+  "In_KEGG",
+  "GO_ID",
+  "GO_Term",
+  "GO_pvalue",
+  "N_GO_terms",
+  "KEGG_ID",
+  "KEGG_Pathway",
+  "KEGG_padj",
+  "N_KEGG_paths",
+  "Notes")]
+
+# Order rows 
+deg_annot <- deg_annot[
+  order(
+    deg_annot$Direction,
+    deg_annot$FDR,
+    -abs(deg_annot$logFC)),]
+
+# Inspect
+head(deg_annot)
+
+cat("Final rows:", nrow(deg_annot),"\n")
+
+# Save integrative table as CSV
+write.csv(deg_annot,
+          file = paste0("Integrative_", comp_name, ".csv"),
+          row.names = FALSE)
+
+
+## 10. FILTER, ORDER AND SAVE HIGH-CONFIDENCE GENES
+# Filter by support count
+deg_annotHCG <- deg_annot[deg_annot$Support_Count >= 2,]
+
+# Order by smallest FDR first
+deg_annotHCG <- deg_annotHCG[
+  order(
+    deg_annotHCG$Direction,
+    deg_annotHCG$FDR,
+    -abs(deg_annotHCG$logFC),
+    -deg_annotHCG$Support_Count),]
+
+# Inspect
+head(deg_annotHCG)
+
+# Save high-confidence genes as CSV
+write.csv(deg_annotHCG,
+  file = paste0("TopCandidates_", comp_name, ".csv"), row.names = FALSE)
+
+```
+
+
+
+## High-Confidence Genes (Volcano vs GO vs KEGG) - Loop over all comparisons
+Here we repeat the analysis in a loop that processes all comparisons.
+```{r Gene Associations: High-Confidence – Loop}
+
+## STORE ALL RESULTS
+integrative_results_all <- list()
+
+## LOOP OVER ALL COMPARISONS
+for (tissue in names(tables)) {
+  for (comp in names(tables[[tissue]])) {
+
+    comp_name <- paste(tissue, comp, sep = "_")
+
+    cat("\n=============================\n")
+    cat("Building:", comp_name, "\n")
+    cat("=============================\n")
+
+    # Store messages
+    skip_messages <- c()
+    warning_messages <- c()
+    
+    # File names
+    file_deg  <- paste0("DEG_", comp_name, ".csv")
+    file_go   <- paste0("topGO_UP_DOWN_", comp_name, ".csv")
+    file_kegg <- paste0("KEGG_UP_DOWN_", comp_name, ".csv")
+    
+    
+## Safety check — all files missing
+    if(
+      !file.exists(file_deg) &
+      !file.exists(file_go) &
+      !file.exists(file_kegg)
+    ){
+
+      skip_messages <- c(
+        skip_messages,
+        "All files missing"
+      )
+
+      integrative_results_all[[comp_name]] <- list(
+        summary = data.frame(
+          Comparison = comp_name,
+          Tissue = tissue,
+          DEGs = 0,
+          GO_Genes = 0,
+          KEGG_Genes = 0,
+          GO_KEGG_Genes = 0,
+          HighConfidence = 0,
+          GO_Terms = 0,
+          KEGG_Pathways = 0,
+          skipped = TRUE,
+          reason = "All files missing",
+          warnings = ""
+        )
+      )
+
+      next
+    }
+    
+    
+## 1. LOAD DATA
+    ## DEGs
+    if(file.exists(file_deg)){
+      deg <- read.csv(file_deg)
+    }
+    
+    ## GO
+    if(!file.exists(file_go)){
+      warning_messages <- c(warning_messages,"Missing GO file")
+      go <- NULL
+    } else {
+      go <- read.csv(file_go)
+    }
+    
+    ## KEGG
+    if(!file.exists(file_kegg)){
+      warning_messages <- c(warning_messages,"Missing KEGG file")
+      kegg <- NULL
+    } else {
+      kegg <- read.csv(file_kegg)
+    }
+    
+    
+## 2. CLEAN DEG TABLE
+  # Clean DEG table
+  deg_clean <- deg[!is.na(deg$SYMBOL) &
+  deg$SYMBOL != "", ]
+
+  # Keep only relevant columns
+  deg_clean <- deg_clean[, c("SYMBOL","logFC","adj.P.Val","diffexpressed")]
+
+  # Rename for clarity
+  colnames(deg_clean) <- c("SYMBOL","logFC","FDR","Direction")
+
+  # Safety check for no rows
+  if(nrow(deg_clean) == 0){
+    skip_messages <- c(skip_messages,"No valid symbols after cleaning")
+    next
+    }
+
+  
+## 3. BUILD GO MAPPING
+if(is.null(go)){
+  go_agg <- data.frame(
+    SYMBOL = character(),
+    Direction = character(),
+    GO_ID = character(),
+    GO_Term = character(),
+    GO_pvalue = character()
+  )
+} else {
+  
+  ## KEEP ONLY SIGNIFICANT TERMS
+  go_sig <- go[
+    go$Fisher.elim < 0.05,
+  ]
+  
+  cat("Significant GO terms:", nrow(go_sig), "\n")
+  
+  ## Safety check
+  if(nrow(go_sig) == 0){
+    warning_messages <- c(
+      warning_messages,
+      "No significant GO terms")
+    
+    go_agg <- data.frame(
+      SYMBOL = character(),
+      Direction = character(),
+      GO_ID = character(),
+      GO_Term = character(),
+      GO_pvalue = character())
+  } else {
+    
+    ## Split GeneSymbols column
+    go_sig$GeneList <- strsplit(
+      as.character(go_sig$GeneSymbols), ",")
+    
+    ## Expand GO table
+     # Stack all data frames created per each row of GO term
+    go_expanded <- do.call(
+      rbind,
+      lapply(
+        1:nrow(go_sig),
+        function(i){
+          
+          # To return if there are no results
+          if(is.na(go_sig$GeneSymbols[i])){
+            return(NULL)
+          }
+          
+          # To remove spaces (trimws) and list structure (unlist)
+          genes <- trimws(
+            unlist(go_sig$GeneList[i])
+          )
+          
+          # To add data to data frame
+          data.frame(
+            SYMBOL = genes,
+            Direction = go_sig$Direction[i],
+            GO_ID = go_sig$GO.ID[i],
+            GO_Term = go_sig$Term[i],
+            GO_pvalue = go_sig$Fisher.elim[i],
+            stringsAsFactors = FALSE)
+        }
+      )
+    )
+    
+    ## Safety check
+    if(is.null(go_expanded) ||
+      nrow(go_expanded) == 0){
+      
+      go_agg <- data.frame(
+        SYMBOL = character(),
+        Direction = character(),
+        GO_ID = character(),
+        GO_Term = character(),
+        GO_pvalue = character())
+    } else {
+      
+      ## Aggregate per SYMBOL + Direction, avoids duplic.DEG rows, gene per row
+      go_agg <- aggregate(
+        . ~ SYMBOL + Direction,
+        data = go_expanded,
+        FUN = function(x){
+          paste(unique(x), collapse = ",")
+        }
+      )
+      
+      cat("Genes represented in significant GO terms:", nrow(go_agg),"\n")
+    }
+  }
+}
+
+  
+  
+## 4. BUILD KEGG MAPPING
+if(is.null(kegg)){
+  
+  kegg_agg <- data.frame(
+    SYMBOL = character(),
+    Direction = character(),
+    KEGG_ID = character(),
+    KEGG_Pathway = character(),
+    KEGG_padj = character())
+} else {
+  
+  ## Split GeneSymbols column
+  kegg$GeneList <- strsplit(
+    as.character(kegg$GeneSymbols), ",")
+  
+  ## Expand KEGG table
+  # Stack all data frames created per each row of KEGG pathway
+  kegg_expanded <- do.call(
+    rbind,
+    lapply(
+      1:nrow(kegg),
+      function(i){
+        
+        # To return if there are no results
+        if(is.na(kegg$GeneSymbols[i])){
+          return(NULL)
+        }
+        
+        # To remove spaces (trimws) and list structure (unlist)
+        genes <- trimws(
+          unlist(kegg$GeneList[i]))
+        
+        # To add data to data frame
+        data.frame(
+          SYMBOL = genes,
+          Direction = kegg$Direction[i],
+          KEGG_ID = kegg$ID[i],
+          KEGG_Pathway = kegg$Description[i],
+          KEGG_padj = kegg$p.adjust[i],
+          stringsAsFactors = FALSE)
+      }
+    )
+  )
+
+  ## Safety check
+  if(is.null(kegg_expanded) ||
+    nrow(kegg_expanded) == 0){
+    
+    kegg_agg <- data.frame(
+      SYMBOL = character(),
+      Direction = character(),
+      KEGG_ID = character(),
+      KEGG_Pathway = character(),
+      KEGG_padj = character())
+  } else {
+  
+  ## Aggregate per SYMBOL + Direction, avoids duplicated DEG rows, gene per row
+    kegg_agg <- aggregate(
+      . ~ SYMBOL + Direction,
+      data = kegg_expanded,
+      FUN = function(x){
+        paste(unique(x), collapse = ",")
+      }
+    )
+    
+    cat("Genes represented in KEGG pathways:", nrow(kegg_agg),"\n")
+  }
+}
+  
+
+  
+## 5. MERGE EVERYTHING
+## Merge GO
+deg_annot <- merge(
+  deg_clean,
+  go_agg,
+  by = c(
+    "SYMBOL",
+    "Direction"
+  ),
+  all.x = TRUE)
+
+## Merge KEGG
+deg_annot <- merge(
+  deg_annot,
+  kegg_agg,
+  by = c(
+    "SYMBOL",
+    "Direction"
+  ),
+  all.x = TRUE)
+
+
+
+## 6. ADD COUNTS
+deg_annot$N_GO_terms <- ifelse(
+  is.na(deg_annot$GO_ID),
+  0,
+  lengths(
+    strsplit(
+      deg_annot$GO_ID,
+      ",")))
+
+deg_annot$N_KEGG_paths <- ifelse(
+  is.na(deg_annot$KEGG_ID),
+  0,
+  lengths(
+    strsplit(
+      deg_annot$KEGG_ID,
+      ",")))
+
+
+
+## 7. ADD FLAGS
+deg_annot$In_GO <- !is.na(deg_annot$GO_ID)
+
+deg_annot$In_KEGG <- !is.na(deg_annot$KEGG_ID)
+
+deg_annot$In_GO_KEGG <-
+  deg_annot$In_GO &
+  deg_annot$In_KEGG
+
+## 7.1. SUPPORT COUNT COLUMN
+# All genes in this table are DEGs
+deg_annot$Volcano <- TRUE
+
+# Count evidence sources
+deg_annot$Support_Count <-
+  as.numeric(deg_annot$Volcano) +
+  as.numeric(deg_annot$In_GO) +
+  as.numeric(deg_annot$In_KEGG)
+
+
+
+## 8. ADD METADATA
+deg_annot$Tissue <- tissue
+
+deg_annot$Comparison <- comp_name
+
+deg_annot$Notes <- ifelse(
+  length(skip_messages) > 0,
+  paste(skip_messages, collapse = " | "),
+  NA
+)
+
+
+## 9. ORDER AND SAVE FULL INTEGRATIVE TABLE
+# Order columns
+deg_annot <- deg_annot[, c(
+  "Tissue",
+  "Comparison",
+  "SYMBOL",
+  "Direction",
+  "FDR",
+  "logFC",
+  "Support_Count",
+  "Volcano",
+  "In_GO",
+  "In_KEGG",
+  "GO_ID",
+  "GO_Term",
+  "GO_pvalue",
+  "N_GO_terms",
+  "KEGG_ID",
+  "KEGG_Pathway",
+  "KEGG_padj",
+  "N_KEGG_paths",
+  "Notes")]
+
+# Order rows 
+deg_annot <- deg_annot[
+  order(
+    deg_annot$Direction,
+    deg_annot$FDR,
+    -abs(deg_annot$logFC)),]
+
+# Inspect
+head(deg_annot)
+
+cat("Final rows:", nrow(deg_annot),"\n")
+
+# Save integrative table as CSV
+write.csv(deg_annot,
+          file = paste0("Integrative_", comp_name, ".csv"),
+          row.names = FALSE)
+
+
+
+## 10. FILTER, ORDER AND SAVE HIGH-CONFIDENCE GENES
+# Filter by support count
+deg_annotHCG <- deg_annot[deg_annot$Support_Count >= 2,]
+
+# Order by smallest FDR first. It considers only the first,
+# then when the rows are similar it considers the next argument.
+deg_annotHCG <- deg_annotHCG[
+  order(
+    deg_annotHCG$Direction,
+    deg_annotHCG$FDR,
+    -abs(deg_annotHCG$logFC),
+    -deg_annotHCG$Support_Count),]
+
+# Safety check 
+    if(nrow(deg_annotHCG) > 0){
+      # Save high-confidence genes as CSV
+      write.csv(deg_annotHCG,
+                file = paste0("TopCandidates_", comp_name, ".csv"), row.names = FALSE)
+    } else {
+      warning_messages <- c(warning_messages,"No high-confidence genes")
+    }
+
+
+## 11. SUMMARY TABLE
+    summary_integrative <- data.frame(
+      Comparison = comp_name,
+      Tissue = tissue,
+
+      DEGs = nrow(deg_clean),
+      GO_Genes = sum(deg_annot$In_GO),
+      KEGG_Genes = sum(deg_annot$In_KEGG),
+      GO_KEGG_Genes = sum(deg_annot$In_GO_KEGG),
+      HighConfidence = nrow(deg_annotHCG),
+      GO_Terms = sum(deg_annot$N_GO_terms),
+      KEGG_Pathways = sum(deg_annot$N_KEGG_paths),
+
+      skipped = length(skip_messages)>0,
+      reason = ifelse(length(skip_messages)>0,
+          paste(skip_messages,collapse=" | "),NA),
+      warnings = ifelse(length(warning_messages) > 0,
+          paste(warning_messages, collapse = " | "),NA))
+
+
+## 12. STORE RESULTS
+    integrative_results_all[[comp_name]] <- list(
+      summary = summary_integrative,
+      skipped = summary_integrative$skipped,
+      reason = summary_integrative$reason,
+      warnings = summary_integrative$warnings)
+  }
+}
+
+
+## AFTER LOOP → MASTER SUMMARY TABLE
+all_summary_integrative <- do.call(rbind,
+  lapply(integrative_results_all,function(x) x$summary))
+
+# Save CSV
+write.csv(all_summary_integrative,
+  file = "SummaryIntegrative_ALL.csv",row.names = FALSE)
+```
+
